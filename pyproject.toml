@@ -1,0 +1,36 @@
+[project]
+name = "os-sim"
+version = "0.0.1"
+description = "Python OS simulation for educational purposes."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.27.2",
+]
+
+[project.scripts]
+os-sim = "src.cli:app"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pyinstaller>=6.22.2",
+    "ruff>=0.16.6",
+    "ty>=0.0.79",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
