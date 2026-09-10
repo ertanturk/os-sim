@@ -3,6 +3,12 @@
 
 ---
 
+<p align="center">
+  <img src="demo.gif" alt="OS Simulator Demo" width="850">
+</p>
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
