@@ -16,7 +16,7 @@
     - [Architectural Overview & Data Paths](#architectural-overview--data-paths)
     - [Register Set](#register-set)
     - [Arithmetic Logic Unit (ALU) & Status Flags](#arithmetic-logic-unit-alu--status-flags)
-    - [Hardware Memory Protection Unit (MPU)](#hardware-memory-protection-unit-mpu)
+    - [Virtual Memory, Paging & Memory Protection (MMU)](#virtual-memory-paging--memory-protection-mmu)
     - [Interrupt Vector Table (IVT) & Hardware Traps](#interrupt-vector-table-ivt--hardware-traps)
     - [Instruction Set Architecture (ISA) Reference](#instruction-set-architecture-isa-reference)
 - [Operating System & Kernel Design](#operating-system--kernel-design)
@@ -24,6 +24,7 @@
     - [Context Switching & ISR Mailbox Mechanism](#context-switching--isr-mailbox-mechanism)
     - [Process Control Block (PCB) & Task Lifecycle](#process-control-block-pcb--task-lifecycle)
     - [Preemptive Task Scheduler](#preemptive-task-scheduler)
+    - [Mutex Synchronization & Deadlock Prevention](#mutex-synchronization--deadlock-prevention)
     - [System Call ABI & Interface](#system-call-abi--interface)
 - [Writing & Executing Code](#writing--executing-code)
     - [1. Interactive Assembly Studio (`asm`)](#1-interactive-assembly-studio-asm)
@@ -35,7 +36,7 @@
 - [Quickstart & CLI Reference](#quickstart--cli-reference)
     - [Command-Line Options](#command-line-options)
     - [Interactive Shell Commands](#interactive-shell-commands)
-- [Testing & Quality Assurance](#testing--quality-assurance)
+    - [Fullscreen Live Split Dashboard (TUI)](#fullscreen-live-split-dashboard-tui)
 
 ---
 
@@ -45,10 +46,12 @@
 
 1. **Physical Memory Bus**: 256 bytes of byte-addressable Random Access Memory (RAM) with memory-mapped mailboxes and write hooks.
 2. **8-bit Accumulator CPU**: A Von Neumann processor core with status flags (`Z`, `C`), hardware traps, dual-mode execution (Kernel Mode vs. User Mode), and cycle-based hardware timer interrupts.
-3. **Hardware Memory Protection Unit (MPU)**: Hardware base and limit registers preventing user processes from tampering with protected kernel memory, ISR trampolines, or other user tasks.
+3. **Memory Management Unit (MMU) & Demand Paging**: 16-frame page table architecture with 16-byte pages, lazy allocation, demand-paging on fault, and hardware memory protection.
 4. **Interrupt Vector Table (IVT)**: Low-memory vectoring for timer interrupts, software traps (`SYSCALL`), and hardware exceptions.
 5. **Preemptive Kernel**: Process Control Blocks (PCBs), priority round-robin task scheduling, an assembly context-switch trampoline, and an expanded system call interface.
-6. **Two-Pass Assembler & Disassembler**: Complete environment allowing users to write, assemble, and execute custom assembly language and machine code tasks.
+6. **Mutex Synchronization & Deadlock Prevention**: In-kernel mutex locking (`SYS_MUTEX_LOCK`, `SYS_MUTEX_UNLOCK`), task wait queues, and strict lock ordering hierarchy to prevent circular wait deadlocks.
+7. **Two-Pass Assembler & Disassembler**: Complete environment allowing users to write, assemble, and execute custom assembly language and machine code tasks.
+8. **Live Split-Screen TUI Dashboard**: Fullscreen terminal interface with dynamic instruction tracing, memory/task views, and persistent right-side CPU/MMU/register inspector.
 
 ---
 
@@ -71,12 +74,13 @@ The CPU implements a classic **8-bit Accumulator Von Neumann Architecture** wher
 |   |   - SP  (Stack Pointer)                   |                   |
 |   +-----------------------+                   v                   |
 |               |                 +-----------------------------+   |
-|               v                 |  Memory Protection Unit     |   |
-|   +-----------------------+     |  - Base Register            |   |
-|   | Control & Decoding    |     |  - Limit Register           |   |
-|   | - Fetch-Decode-Execute|<--->|  - Kernel / User Mode Ring  |   |
-|   | - Trap / Fault Vector |     +-----------------------------+   |
-|   +-----------------------+                   |                   |
+|               v                 | Memory Management Unit(MMU) |   |
+|   +-----------------------+     | - 16-Frame Page Table       |   |
+|   | Control & Decoding    |     | - Demand Paging Translation |   |
+|   | - Fetch-Decode-Execute|<--->| - Base / Limit Fallback     |   |
+|   | - Trap / Fault Vector |     | - Kernel / User Mode Ring   |   |
+|   +-----------------------+     +-----------------------------+   |
+|                                               |                   |
 +===============|===============================|===================+
                 |                               |
                 +---------------+---------------+
@@ -84,12 +88,9 @@ The CPU implements a classic **8-bit Accumulator Von Neumann Architecture** wher
                                 v
 +===================================================================+
 |                    PHYSICAL RAM (256 BYTES)                       |
-|   0x00 - 0x1F : Interrupt Vector Table (IVT)                      |
-|   0x20 - 0x2F : Context-Switch Assembly ISR Trampoline            |
-|   0x30 - 0x3F : Kernel Idle Task (Low-Power Wait Loop)            |
-|   0x40 - 0xF9 : User Space Partitions (Code, Heap, Stack)         |
-|   0xFA - 0xFB : Preemptive Context Switch Mailboxes (Old/New SP)  |
-|   0xFC - 0xFF : High RAM Reserved Space                           |
+|   0x00 - 0x3F : Kernel Space (IVT, ISR Trampoline, Idle Task)     |
+|   0x40 - 0xEF : User Physical Frame Pool (Pages 4-14, 176 Bytes)  |
+|   0xF0 - 0xFF : Context Switch Mailboxes & High RAM Buffer        |
 +===================================================================+
 ```
 
@@ -112,20 +113,27 @@ The ALU performs 8-bit operations. Calculations produce an 8-bit result (`& 0xFF
 - **Zero Flag (`Z`)**: Set to `1` (True) when the resulting value in `ACC` is exactly `0x00`; cleared to `0` (False) otherwise. Used for conditional branching (`JZ`).
 - **Carry Flag (`C`)**: Set to `1` (True) when an arithmetic operation overflows `0xFF` (addition, multiplication) or underflows below `0` (subtraction); cleared to `0` otherwise.
 
-### Hardware Memory Protection Unit (MPU)
+### Virtual Memory, Paging & Memory Protection (MMU)
 
-The CPU includes hardware memory bounds enforcement to isolate user tasks from each other and protect the kernel:
+The CPU and Kernel implement a page-table-based virtual memory system with demand paging and hardware isolation:
 
-- **Base Register**: Stores the lowest physical address accessible to the current user task.
-- **Limit Register**: Stores the upper physical address limit (`[Base, Limit)`) accessible to the current user task.
-- **Kernel Mode vs. User Mode**:
-    - In **Kernel Mode** (`kernel_mode = True`), the CPU has unrestricted access to all 256 bytes of RAM and can execute privileged instructions (`HALT`, `IRET`).
-    - In **User Mode** (`kernel_mode = False`), any memory read, write, or instruction fetch outside `[Base, Limit)` immediately triggers an MPU hardware trap:
-        - **`Segmentation Fault: Illegal Memory Write`**
-        - **`Segmentation Fault: Illegal Memory Read`**
-        - **`Segmentation Fault: Illegal Instruction Fetch`**
-        - **`Privilege Violation`** (attempting to execute `HALT` or `IRET` from user space)
-    - The Kernel intercepts these faults, prints diagnostic messages, terminates the offending task with exit code `255`, and schedules the next eligible task.
+- **16-Frame Page Table**: The 256-byte physical memory space is divided into 16 frames of 16 bytes each:
+    - **Frames 0–3 (`0x00`–`0x3F`)**: Reserved for Kernel space (IVT vectors, context-switch ISR trampoline, idle task).
+    - **Frames 4–14 (`0x40`–`0xEF`)**: Dynamically allocated physical user frame pool for process code, data, heap, and stack.
+    - **Frame 15 (`0xF0`–`0xFF`)**: Context-switch mailboxes (`0xFA`, `0xFB`) and high-memory buffer.
+- **Lazy Page Allocation**: At task creation via `load_task_code()`, the kernel pre-allocates only the code pages and stack page. Intermediate heap and data pages remain unmapped (`valid = False`).
+- **Demand Paging on Fault**: When a user program accesses an unmapped virtual address within its partition `[Base, Limit)`:
+    1. The CPU address translation pipeline (`translate_address()`) detects `valid == False` and invokes `kernel.handle_page_fault()`.
+    2. The kernel allocates a free physical frame from its frame pool, zeroes the frame memory, and maps it in the task's page table.
+    3. The CPU translation succeeds and execution continues transparently without terminating the program.
+- **Kernel Mode vs. User Mode & Protection Traps**:
+    - In **Kernel Mode** (`kernel_mode = True`), the CPU has unrestricted direct access to all RAM and can execute privileged instructions (`HALT`, `IRET`).
+    - In **User Mode** (`kernel_mode = False`):
+        - Accesses outside `[Base, Limit)` or when physical memory is exhausted trigger memory protection traps:
+            - **`Page Fault: Invalid virtual address 0xXX`**
+            - **`Privilege Violation`** (attempting to execute `HALT` or `IRET` from user space)
+        - The Kernel intercepts these faults, logs diagnostic messages, terminates the offending task with exit code `255`, frees all its allocated physical frames, and schedules the next eligible task.
+- **Legacy Fallback**: If a task does not use paging, the CPU falls back to hardware `Base` and `Limit` register bounds enforcement.
 
 ### Interrupt Vector Table (IVT) & Hardware Traps
 
@@ -217,7 +225,7 @@ When a timer interrupt fires:
 2. Execution jumps to `0x20` (the ISR trampoline).
 3. The trampoline writes the outgoing `SP` to address `0xFA`.
 4. Writing to `0xFA` fires a hardware memory hook in `RAM`, triggering `kernel.schedule()`.
-5. The kernel scheduler selects the next task from the ready queue, configures the CPU's MPU `base_address` and `limit_address`, and writes the incoming task's `task_sp` to `0xFB`.
+5. The kernel scheduler selects the next task from the ready queue, configures the CPU's `base_address`, `limit_address`, and active `page_table`, and writes the incoming task's `task_sp` to `0xFB`.
 6. Control returns to the ISR trampoline, which loads the incoming SP and executes `IRET`, restoring the incoming task's state.
 
 ### Process Control Block (PCB) & Task Lifecycle
@@ -226,18 +234,21 @@ Every process is represented by a Process Control Block (PCB):
 
 ```python
 PCB = {
-    "task_id": 0,           # Unique Process Identifier (PID)
-    "name": "Task_Name",    # Human-readable identifier
-    "priority": 1,          # Scheduling priority (higher = prioritized)
-    "state": TaskState,     # READY, RUNNING, SLEEPING, BLOCKED, TERMINATED
-    "entry_point": 0x40,    # Instruction start address
-    "base": 0x40,           # MPU Lower memory boundary
-    "limit": 0x60,          # MPU Upper memory boundary
-    "task_sp": 0x5B,        # Saved Stack Pointer
-    "stack_top": 0x5F,      # Initial top of stack
-    "sleep_ticks": 0,       # Ticks remaining for sleeping tasks
-    "wait_pid": None,       # PID this task is blocked waiting on
-    "exit_code": None,      # Return code after termination
+    "task_id": 0,  # Unique Process Identifier (PID)
+    "name": "Task_Name",  # Human-readable identifier
+    "priority": 1,  # Scheduling priority (higher = prioritized)
+    "state": TaskState,  # READY, RUNNING, SLEEPING, BLOCKED, TERMINATED
+    "entry_point": 0x40,  # Instruction start address
+    "base": 0x40,  # Virtual memory partition base
+    "limit": 0x60,  # Virtual memory partition limit
+    "task_sp": 0x5B,  # Saved Stack Pointer
+    "stack_top": 0x5F,  # Initial top of stack
+    "sleep_ticks": 0,  # Ticks remaining for sleeping tasks
+    "wait_pid": None,  # PID this task is blocked waiting on
+    "exit_code": None,  # Return code after termination
+    "locks": [],  # List of acquired mutex lock IDs
+    "page_table": dict,  # 16-entry page table {page: {"frame": int, "valid": bool}}
+    "page_faults": 0,  # Count of page faults handled on-demand
 }
 ```
 
@@ -274,24 +285,47 @@ The Kernel scheduler (`src.kernel.Scheduler`) supports three selectable policies
 
 Timer ticks decrement `sleep_ticks` for sleeping tasks on every scheduling quantum. When all user tasks are sleeping, the kernel activates an internal low-power **Idle Task** at `0x30`.
 
+### Mutex Synchronization & Deadlock Prevention
+
+The kernel provides built-in mutual exclusion (`mutex`) primitives to coordinate concurrent access to shared resources across user processes:
+
+- **Lock Acquisition (`SYS_MUTEX_LOCK` / `SYS_LOCK`)**:
+  - If the requested lock is free, the task marks the lock as taken and records ownership.
+  - If the lock is already held by another PID, the task is marked as `TaskState.BLOCKED`, added to the lock's FIFO `wait_queue`, and the scheduler immediately dispatches the next ready task.
+- **Lock Release (`SYS_MUTEX_UNLOCK` / `SYS_UNLOCK`)**:
+  - When the owning process releases a lock, the kernel dequeues the first waiting task from `wait_queue`, transitions it to `TaskState.READY`, and transfers lock ownership.
+  - If no tasks are waiting, the lock is cleared to an unlocked state.
+- **Deadlock Prevention via Strict Lock Ordering**:
+  - To prevent circular wait conditions (the classic Dining Philosophers deadlock), the kernel enforces an ascending lock acquisition hierarchy.
+  - A process attempting to acquire `lock_id` while already holding locks must ensure that `lock_id` is **strictly greater** than all currently held lock IDs (`lock_id > max(held_locks)`).
+  - Any violation immediately raises a kernel fault diagnostic:
+    `Lock Ordering Violation: Task X attempted to acquire lock Y while holding lock(s) Z (must be strictly greater)`
+  - The offending task is terminated safely, preserving overall system stability.
+- **Process Termination Cleanup**:
+  - When a process terminates via `SYS_EXIT` or is killed via `SYS_KILL`, the kernel iterates all active locks:
+    1. Removes the terminated task from all mutex wait queues.
+    2. Releases any locks held by the terminated task, automatically waking the next eligible waiter or clearing the lock.
+
 ### System Call ABI & Interface
 
 User tasks invoke kernel services by loading the system call ID into `ACC`, passing arguments in `R1` and `R2`, and executing `SYSCALL` (or `INT 5`):
 
-|    ID    | Syscall Constant | Arguments               | Return Value (ACC) | Description                                              |
-| :------: | :--------------- | :---------------------- | :----------------: | :------------------------------------------------------- |
-| **`1`**  | `SYS_YIELD`      | None                    |         -          | Voluntarily yields the remainder of the CPU timeslice.   |
-| **`2`**  | `SYS_EXIT`       | `R1 = Exit code`        |         -          | Terminates the calling process with exit status code.    |
-| **`3`**  | `SYS_SLEEP`      | `R1 = Ticks`            |        `0`         | Puts the calling task to sleep for N timer ticks.        |
-| **`4`**  | `SYS_GETPID`     | None                    |       `PID`        | Returns the calling task's Process ID.                   |
-| **`5`**  | `SYS_PRINT_NUM`  | `R1 = Number`           |        `0`         | Prints an 8-bit integer (`0-255`) to the kernel console. |
-| **`6`**  | `SYS_PRINT_CHAR` | `R1 = ASCII`            |        `0`         | Prints a single ASCII character to the kernel console.   |
-| **`7`**  | `SYS_PRINT_STR`  | `R1 = Addr, R2 = Len`   |       Length       | Prints string from RAM within MPU bounds.                |
-| **`8`**  | `SYS_SPAWN`      | `R1 = Entry, R2 = Prio` |      New PID       | Allocates a partition and registers a child process.     |
-| **`9`**  | `SYS_WAIT`       | `R1 = Target PID`       |     Exit Code      | Blocks calling task until target PID terminates.         |
-| **`10`** | `SYS_KILL`       | `R1 = Target PID`       |    `0` or `255`    | Terminates a target task by PID.                         |
-| **`11`** | `SYS_GET_TICKS`  | None                    |     Tick count     | Returns total elapsed system timer ticks.                |
-| **`12`** | `SYS_ALLOC`      | `R1 = Bytes`            |     Heap Addr      | Allocates heap memory within the task partition.         |
+|    ID    | Syscall Constant                 | Arguments               | Return Value (ACC) | Description                                                                |
+| :------: | :------------------------------- | :---------------------- | :----------------: | :------------------------------------------------------------------------- |
+| **`1`**  | `SYS_YIELD`                      | None                    |         -          | Voluntarily yields the remainder of the CPU timeslice.                     |
+| **`2`**  | `SYS_EXIT`                       | `R1 = Exit code`        |         -          | Terminates the calling process with exit status code.                      |
+| **`3`**  | `SYS_SLEEP`                      | `R1 = Ticks`            |        `0`         | Puts the calling task to sleep for N timer ticks.                          |
+| **`4`**  | `SYS_GETPID`                     | None                    |       `PID`        | Returns the calling task's Process ID.                                     |
+| **`5`**  | `SYS_PRINT_NUM`                  | `R1 = Number`           |        `0`         | Prints an 8-bit integer (`0-255`) to the kernel console.                   |
+| **`6`**  | `SYS_PRINT_CHAR`                 | `R1 = ASCII`            |        `0`         | Prints a single ASCII character to the kernel console.                     |
+| **`7`**  | `SYS_PRINT_STR`                  | `R1 = Addr, R2 = Len`   |       Length       | Prints string from RAM within MPU/MMU bounds.                              |
+| **`8`**  | `SYS_SPAWN`                      | `R1 = Entry, R2 = Prio` |      New PID       | Allocates a partition and registers a child process.                       |
+| **`9`**  | `SYS_WAIT`                       | `R1 = Target PID`       |     Exit Code      | Blocks calling task until target PID terminates.                           |
+| **`10`** | `SYS_KILL`                       | `R1 = Target PID`       |    `0` or `255`    | Terminates a target task by PID.                                           |
+| **`11`** | `SYS_GET_TICKS`                  | None                    |     Tick count     | Returns total elapsed system timer ticks.                                  |
+| **`12`** | `SYS_ALLOC`                      | `R1 = Bytes`            |     Heap Addr      | Allocates heap memory within the task partition.                           |
+| **`13`** | `SYS_MUTEX_LOCK` (`SYS_LOCK`)    | `R1 = Lock ID`          |        `0`         | Acquires mutex lock; blocks if contended; enforces strict lock hierarchy.  |
+| **`14`** | `SYS_MUTEX_UNLOCK` (`SYS_UNLOCK`)| `R1 = Lock ID`          |        `0`         | Releases mutex lock; unblocks next task in wait queue.                     |
 
 ---
 
@@ -400,7 +434,7 @@ The assembler supports standard assembly language features:
     - `.ASCII "string"`: Defines an ASCII string literal.
     - `.ASCIIZ "string"` / `.STRING`: Defines a null-terminated (`\0`) ASCII string.
     - `<NAME> EQU <val>` / `.EQU <NAME>, <val>`: Defines symbolic constants.
-- **Built-in Symbols**: All syscalls (`SYS_YIELD`, `SYS_PRINT_NUM`, `SYS_PRINT_STR`, `SYS_EXIT`, etc.) and IVT constants (`IVT_TIMER`, `IVT_SYSCALL`) are built-in symbols.
+- **Built-in Symbols**: All syscalls (`SYS_YIELD`, `SYS_EXIT`, `SYS_SLEEP`, `SYS_GETPID`, `SYS_PRINT_NUM`, `SYS_PRINT_CHAR`, `SYS_PRINT_STR`, `SYS_SPAWN`, `SYS_WAIT`, `SYS_KILL`, `SYS_GET_TICKS`, `SYS_ALLOC`, `SYS_MUTEX_LOCK` / `SYS_LOCK`, `SYS_MUTEX_UNLOCK` / `SYS_UNLOCK`) and IVT constants (`IVT_TIMER`, `IVT_KEYBOARD`, `IVT_DIV_ZERO`, `IVT_INVALID_OP`, `IVT_PAGE_FAULT`, `IVT_SYSCALL`) are built-in symbols.
 
 ---
 
@@ -506,12 +540,12 @@ loop:
 
 ### 5. `examples/rogue.asm` - Memory Protection Fault Demonstration
 
-Attempts an illegal write into Kernel IVT memory space (`0x10`) to demonstrate MPU traps:
+Attempts an illegal write into Kernel IVT memory space (`0x10`) to demonstrate MMU memory protection traps:
 
 ```assembly
     LOAD_IMM 0xEE
     STORE 0x10              ; Attempt write to protected kernel IVT vector
-                            ; MPU traps this with Segmentation Fault!
+                            ; MMU traps this with Page Fault / Segmentation Fault!
     LOAD_IMM SYS_EXIT
     SYSCALL
 ```
@@ -522,21 +556,54 @@ Attempts an illegal write into Kernel IVT memory space (`0x10`) to demonstrate M
 
 ### Command-Line Options
 
+`os-sim` can be launched via `uv run os-sim` (or `python src/cli.py`):
+
 ```bash
 # Boot into interactive OS shell
-uv run python cli.py
+uv run os-sim boot
 
-# Boot with custom broadcast banner text
-uv run python cli.py --say "Welcome to Educational OS Simulator"
+# Launch fullscreen live split-screen dashboard
+uv run os-sim dashboard
 
-# Assemble and run an assembly file in batch mode
-uv run python cli.py asm examples/hello.asm --quick --batch
+# Boot with custom broadcast banner text and instant animations
+uv run os-sim --say "Welcome to Educational OS Simulator" --quick
 
-# Launch interactive Assembly Studio
-uv run python cli.py asm
+# Run built-in demo suite directly in batch mode
+uv run os-sim demo all --steps 50 --batch
 
-# Run built-in demo suite in batch mode
-uv run python cli.py demo all --quick --batch
+# Assemble and run an assembly file directly
+uv run os-sim asm examples/hello.asm --batch
+
+# Inspect CPU registers, ALU status flags, and MMU page table
+uv run os-sim cpu
+
+# Display OS subsystem health and task counts
+uv run os-sim status
+```
+
+#### CLI Syntax & Flags
+
+```text
+Usage: os-sim [OPTIONS] COMMAND [ARGS]...
+
+Options:
+  -D, --dashboard       Launch fullscreen live split-screen dashboard directly.
+  -s, --say, -t, --text Custom startup broadcast text.
+  --speed FLOAT         Animation speed multiplier (default: 1.0, 0 for instant).
+  --animation / --no-animation Toggle startup loading animation.
+  -q, --quick           Quick mode (disable animation delays).
+  -d, --demo TEXT       Load and execute a built-in demo directly.
+  -a, --asm TEXT        Assemble and run an assembly (.asm) file directly.
+  --steps INTEGER       Maximum simulation steps if running a demo (default: 100).
+  --batch               Exit after boot/demo instead of opening interactive shell.
+
+Commands:
+  dashboard / tui       Launch fullscreen live split dashboard with persistent inspector.
+  boot                  Boot the OS simulation and enter the interactive shell.
+  demo [name]           Boot OS, load demonstration program, and execute.
+  asm [file]            Write, assemble, and execute assembly code tasks.
+  cpu                   Display detailed CPU registers, ALU flags, executing frame, and MMU table.
+  status                Display overall OS subsystem health and task counts.
 ```
 
 ### Interactive Shell Commands
@@ -545,13 +612,14 @@ Once booted, the `os-sim>` prompt supports the following commands:
 
 | Command                    | Arguments                                       | Description                                                                                       |
 | :------------------------- | :---------------------------------------------- | :------------------------------------------------------------------------------------------------ |
-| **`help`** / **`?`**       |                                                 | Display command reference manual.                                                                 |
+| **`help`** / **`?`**       |                                                 | Display interactive shell commands manual.                                                        |
+| **`dashboard`** / **`tui`**| `[demo]`                                        | Launch fullscreen live split dashboard with persistent right-side inspector.                      |
 | **`status`**               |                                                 | Show OS subsystem health, ticks, cycle count, and task counts.                                    |
-| **`cpu`**                  |                                                 | Display detailed CPU registers (`ACC`, `R1`, `R2`, `PC`, `SP`), flags (`Z`, `C`), and MPU bounds. |
+| **`cpu`** / **`mmu`**      |                                                 | Display CPU registers (`ACC`, `R1`, `R2`, `PC`, `SP`), flags (`Z`, `C`), frame, and MMU table.    |
 | **`mem`** / **`ram`**      | `[start=0] [len=256]`                           | Inspect colored RAM hex dump with tagged memory regions.                                          |
 | **`ps`** / **`tasks`**     |                                                 | List all Process Control Blocks (PCBs) and task lifecycle states.                                 |
-| **`asm`**                  | `[name]`                                        | Launch the **Interactive Assembly Studio** to write and run code.                                 |
-| **`code`**                 | `<name> <b0> <b1>...`                           | Load machine code bytes into a new task PCB and RAM partition.                                    |
+| **`asm`**                  | `[name]`                                        | Launch the **Interactive Assembly Studio** to write and compile code.                              |
+| **`code`** / **`task-code`** | `<name> <b0> <b1>...`                        | Load machine code bytes into a new task PCB and RAM partition.                                    |
 | **`exec`** / **`run-asm`** | `<file.asm> [steps=100]`                        | Assemble an `.asm` file and execute immediately.                                                  |
 | **`load-asm`**             | `<file.asm> [prio] [size]`                      | Assemble an `.asm` file and register task in `READY` state.                                       |
 | **`disasm`**               | `[start=0x40] [len=16]`                         | Disassemble raw RAM bytes into human-readable instructions.                                       |
@@ -567,4 +635,36 @@ Once booted, the `os-sim>` prompt supports the following commands:
 | **`say`**                  | `<text>`                                        | Animate typewriter text broadcast.                                                                |
 | **`reboot`**               | `[custom_text]`                                 | Reset simulation and replay POST boot sequence.                                                   |
 | **`clear`**                |                                                 | Clear the terminal display.                                                                       |
-| **`exit`**                 |                                                 | Power down the operating system simulator.                                                        |
+| **`exit`** / **`shutdown`**|                                                 | Power down the operating system simulator.                                                        |
+
+### Fullscreen Live Split Dashboard (TUI)
+
+The simulator features a responsive fullscreen terminal dashboard (`os-sim dashboard`, `os-sim tui`, or `dashboard` command in shell):
+
+```text
++-------------------------------------------------------------+------------------------------------+
+| OS-SIM LIVE DASHBOARD                                       | REGISTERS & MMU INSPECTOR          |
+| Status: Ready / Running                                     | ACC: 0x01   R1: 0x05   R2: 0x00    |
++-------------------------------------------------------------+ PC:  0x42   SP: 0x5D   Flags: [Z]  |
+| INSTRUCTION TRACE                                           | Exec Frame: Virtual 0x40 -> Phys 4 |
+| 0x40: LOAD_IMM 1                                            +------------------------------------+
+| 0x42: ADD R1                                                | MMU PAGE TABLE (16 Frames)         |
+| 0x43: MOV R1, ACC                                           | Page 0-3  : Kernel                 |
++-------------------------------------------------------------+ Page 4    : Phys Frame 4 (Code)    |
+| SUBVIEW PANEL [Tab to Cycle: Tasks | RAM | MMU | Logs]      | Page 5    : Phys Frame 5 (Stack)   |
+| PID 0: Task_Counter [RUNNING] Priority: 1                   +------------------------------------+
+|                                                             | HELD MUTEX LOCKS                   |
++-------------------------------------------------------------+ None                               |
+| CONTROLS: [S] Step 1  [Space] Step 5  [R] Run/Pause  [Tab] Subview  [Q] Exit                     |
++--------------------------------------------------------------------------------------------------+
+```
+
+- **Dual-Pane Architecture**:
+  - **Left Pane**: Dynamic instruction trace showing previous, current, and upcoming instructions, plus an interactive subview (`Tasks`, `RAM hex dump`, `MMU Page Table`, `Kernel Console Log`), and hotkey reference.
+  - **Right Pane**: Persistent live status inspector displaying CPU registers (`ACC`, `R1`, `R2`, `PC`, `SP`), ALU status flags (`Z`, `C`), current virtual-to-physical address translation, frame pool status, page fault metrics, and held mutex locks.
+- **Interactive Controls**:
+  - **`S`**: Single-step one instruction.
+  - **`Space`**: Step 5 instructions.
+  - **`R`**: Toggle continuous execution (Run / Pause).
+  - **`Tab`**: Cycle subview panel across Tasks, RAM memory map, MMU page table, and kernel console logs.
+  - **`Q`** / **`Ctrl+C`**: Exit dashboard and return to terminal or shell.

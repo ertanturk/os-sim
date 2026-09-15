@@ -84,6 +84,10 @@ BUILTIN_SYMBOLS: dict[str, int] = {
     "SYS_KILL": 0x0A,
     "SYS_GET_TICKS": 0x0B,
     "SYS_ALLOC": 0x0C,
+    "SYS_MUTEX_LOCK": 0x0D,
+    "SYS_MUTEX_UNLOCK": 0x0E,
+    "SYS_LOCK": 0x0D,
+    "SYS_UNLOCK": 0x0E,
     # IVT Vectors
     "IVT_TIMER": 0x00,
     "IVT_KEYBOARD": 0x01,

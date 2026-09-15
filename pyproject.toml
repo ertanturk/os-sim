@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling>=1.32.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "os-sim"
 version = "0.0.1"
@@ -7,9 +11,13 @@ requires-python = ">=3.14"
 dependencies = [
     "typer>=0.27.2",
 ]
+license = { text = "MIT" }
+authors = [
+    { name = "Ertan Tunç Türk" },
+]
 
 [project.scripts]
-os-sim = "src.cli:app"
+os-sim = "cli:app"
 
 [dependency-groups]
 dev = [
@@ -34,3 +42,6 @@ minversion = "8.0"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

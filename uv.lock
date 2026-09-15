@@ -119,7 +119,7 @@ wheels = [
 [[package]]
 name = "os-sim"
 version = "0.0.1"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "typer" },
 ]

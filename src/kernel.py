@@ -27,6 +27,18 @@ class SchedulingPolicy(Enum):
     FIFO = "fifo"
 
 
+def create_default_page_table() -> dict[int, dict]:
+    """Create an isolated page table with 16 entries (pages 0-15) for an 8-bit architecture.
+
+    Each entry:
+    {
+        "frame": 0,       # Physical frame number (0-15)
+        "valid": False,   # Whether this page is currently allocated
+    }
+    """
+    return {page: {"frame": 0, "valid": False} for page in range(16)}
+
+
 class PCB(dict):
     """Process Control Block holding execution context, memory bounds, and scheduling metadata.
 
@@ -41,13 +53,18 @@ class PCB(dict):
         priority: int,
         entry_point: int,
         stack_top: int,
-        base: int,
-        limit: int,
+        base: int = 0,
+        limit: int = 256,
         task_sp: int | None = None,
         state: TaskState = TaskState.READY,
         parent_id: int | None = None,
+        locks: list[int] | None = None,
+        page_table: dict[int, dict] | None = None,
     ):
         sp = stack_top - 5 if task_sp is None else task_sp
+        if page_table is None:
+            page_table = create_default_page_table()
+
         super().__init__(
             task_id=task_id,
             task_name=name,
@@ -67,7 +84,13 @@ class PCB(dict):
             parent_id=parent_id,
             heap_ptr=base,
             cpu_cycles=0,
+            locks=[] if locks is None else list(locks),
+            page_table=page_table,
+            page_faults=0,
         )
+
+        # Replaces base and limit in PCB
+        self["page_table"] = page_table
 
     @property
     def task_id(self) -> int:
@@ -194,6 +217,30 @@ class PCB(dict):
     def parent_id(self, val: int | None) -> None:
         self["parent_id"] = val
 
+    @property
+    def locks(self) -> list[int]:
+        return self["locks"]
+
+    @locks.setter
+    def locks(self, val: list[int]) -> None:
+        self["locks"] = val
+
+    @property
+    def page_table(self) -> dict[int, dict]:
+        return self["page_table"]
+
+    @page_table.setter
+    def page_table(self, val: dict[int, dict]) -> None:
+        self["page_table"] = val
+
+    @property
+    def page_faults(self) -> int:
+        return self["page_faults"]
+
+    @page_faults.setter
+    def page_faults(self, val: int) -> None:
+        self["page_faults"] = val
+
 
 class Scheduler:
     """Manages scheduling algorithms and ready queue selection."""
@@ -281,6 +328,10 @@ class Kernel:
     SYS_KILL: int = 0x0A
     SYS_GET_TICKS: int = 0x0B
     SYS_ALLOC: int = 0x0C
+    SYS_MUTEX_LOCK: int = 0x0D
+    SYS_MUTEX_UNLOCK: int = 0x0E
+    SYS_LOCK: int = 0x0D  # Alias
+    SYS_UNLOCK: int = 0x0E  # Alias
 
     # Assembly ISR Machine Code:
     # MOV ACC, SP (0x27) -> STORE 0xFA (0x02, 0xFA) ->
@@ -305,10 +356,15 @@ class Kernel:
         self.total_cycles: int = 0
         self.console_output: list[str] = []
         self.custom_syscalls: dict[int, Callable[[Kernel, int, int], int | None]] = {}
+        self.locks: dict[int, dict] = {}
+        self.last_fault: str | None = None
         self.scheduler = Scheduler(policy=SchedulingPolicy.PRIORITY_ROUND_ROBIN)
+        self.free_frames: list[int] = list(range(4, 15))
 
         self.cpu.syscall_handler = self.handle_syscall
         self.cpu.fault_handler = self.handle_fault
+        self.cpu.page_fault_handler = self.handle_page_fault
+        self.page_fault_count: int = 0
 
         self.idle_task: PCB | None = None
         self._is_idle_running: bool = False
@@ -316,6 +372,67 @@ class Kernel:
 
         if hasattr(self.ram, "add_write_hook"):
             self.ram.add_write_hook(self.MAILBOX_OLD_SP, self.schedule)
+
+    def alloc_frame(self) -> int:
+        """Allocate a free physical frame (4-14)."""
+        if not self.free_frames:
+            raise RuntimeError("Out of physical memory: No free frames available.")
+        return self.free_frames.pop(0)
+
+    def alloc_frame_for_page(self, preferred_frame: int | None = None) -> int:
+        """Allocate preferred physical frame if available, otherwise any free frame."""
+        if preferred_frame is not None and preferred_frame in self.free_frames:
+            self.free_frames.remove(preferred_frame)
+            return preferred_frame
+        return self.alloc_frame()
+
+    def free_frame(self, frame: int) -> None:
+        """Return a physical frame to the free frame pool."""
+        if 4 <= frame < 15 and frame not in self.free_frames:
+            self.free_frames.append(frame)
+            self.free_frames.sort()
+
+    def free_task_frames(self, task: PCB) -> None:
+        """Free physical frames allocated to a task's page table."""
+        pt = task.get("page_table")
+        if not pt:
+            return
+        for entry in pt.values():
+            if entry.get("valid"):
+                frame = entry.get("frame")
+                if frame is not None and 4 <= frame < 15:
+                    self.free_frame(frame)
+                entry["valid"] = False
+
+    def get_free_frame_count(self) -> int:
+        """Return the number of currently free physical frames."""
+        return len(self.free_frames)
+
+    def _read_task_byte(self, task: PCB, vaddr: int) -> int:
+        pt = task.get("page_table")
+        if pt is not None:
+            page = (vaddr & 0xFF) >> 4
+            entry = pt.get(page)
+            if (not entry or not entry.get("valid")) and (task["base"] <= (vaddr & 0xFF) < task["limit"]):
+                self.handle_page_fault(vaddr, task=task)
+                entry = pt.get(page)
+            if entry and entry.get("valid"):
+                return self.ram.read((entry["frame"] << 4) | (vaddr & 0x0F))
+            return 0
+        return self.ram.read(vaddr)
+
+    def _write_task_byte(self, task: PCB, vaddr: int, val: int) -> None:
+        pt = task.get("page_table")
+        if pt is not None:
+            page = (vaddr & 0xFF) >> 4
+            entry = pt.get(page)
+            if (not entry or not entry.get("valid")) and (task["base"] <= (vaddr & 0xFF) < task["limit"]):
+                self.handle_page_fault(vaddr, task=task)
+                entry = pt.get(page)
+            if entry and entry.get("valid"):
+                self.ram.write((entry["frame"] << 4) | (vaddr & 0x0F), val & 0xFF)
+            return
+        self.ram.write(vaddr, val & 0xFF)
 
     def _init_idle_task(self) -> None:
         """Set up a benign in-memory idle task to run when all user tasks are sleeping."""
@@ -331,6 +448,10 @@ class Kernel:
         self.ram.write(idle_stack_top - 3, 0x00)  # R2
         self.ram.write(idle_stack_top - 4, 0x00)  # Flags
 
+        idle_page_table = create_default_page_table()
+        for p in range(4):
+            idle_page_table[p] = {"frame": p, "valid": True}
+
         self.idle_task = PCB(
             task_id=self.IDLE_TASK_ID,
             name="[idle]",
@@ -341,6 +462,7 @@ class Kernel:
             limit=0x40,
             task_sp=idle_stack_top - 5,
             state=TaskState.READY,
+            page_table=idle_page_table,
         )
 
     def install_isr(self) -> None:
@@ -358,17 +480,9 @@ class Kernel:
         base: int,
         limit: int,
         parent_id: int | None = None,
+        page_table: dict[int, dict] | None = None,
     ) -> PCB:
         """Forge a 5-byte interrupt frame in RAM and register the task PCB."""
-        # Push fake hardware context in reverse order of IRET pops:
-        # flags (pop 1st), R2 (pop 2nd), R1 (pop 3rd), ACC (pop 4th), PC (pop 5th)
-        self.ram.write(stack_top, entry_point & 0xFF)  # PC (popped last)
-        self.ram.write(stack_top - 1, 0x00)  # ACC
-        self.ram.write(stack_top - 2, 0x00)  # R1
-        self.ram.write(stack_top - 3, 0x00)  # R2
-        self.ram.write(stack_top - 4, 0x00)  # Flags (popped first)
-
-        # SP points to stack_top - 5 so the first pop() targets stack_top - 4
         task_pcb = PCB(
             task_id=task_id,
             name=name,
@@ -380,7 +494,17 @@ class Kernel:
             task_sp=stack_top - 5,
             state=TaskState.READY,
             parent_id=parent_id,
+            page_table=page_table,
         )
+
+        # Push fake hardware context in reverse order of IRET pops:
+        # flags (pop 1st), R2 (pop 2nd), R1 (pop 3rd), ACC (pop 4th), PC (pop 5th)
+        self._write_task_byte(task_pcb, stack_top, entry_point & 0xFF)  # PC (popped last)
+        self._write_task_byte(task_pcb, stack_top - 1, 0x00)  # ACC
+        self._write_task_byte(task_pcb, stack_top - 2, 0x00)  # R1
+        self._write_task_byte(task_pcb, stack_top - 3, 0x00)  # R2
+        self._write_task_byte(task_pcb, stack_top - 4, 0x00)  # Flags (popped first)
+
         self.tasks.append(task_pcb)
         return task_pcb
 
@@ -392,7 +516,7 @@ class Kernel:
         partition_size: int = 32,
         base_address: int | None = None,
     ) -> PCB:
-        """Allocate a memory partition, write machine code into RAM, and register a task PCB."""
+        """Allocate a memory partition, assign physical frames, write machine code, and register task PCB."""
         if not code:
             raise ValueError("Cannot load empty code into task.")
 
@@ -405,10 +529,10 @@ class Kernel:
         actual_size = max(partition_size, len(code) + 10)
         limit = base + actual_size
 
-        if limit > len(self.ram.memory) - 8:
+        if limit > 256:
             raise RuntimeError(
                 f"Out of memory: Task '{name}' requires partition up to 0x{limit:02X}, "
-                f"exceeding RAM boundary 0x{len(self.ram.memory) - 8:02X}."
+                f"exceeding RAM boundary 0x100."
             )
 
         if len(code) > (limit - base - 6):
@@ -417,9 +541,30 @@ class Kernel:
                 f"Need room for 5-byte stack frame."
             )
 
-        # Write machine code into RAM starting at base
-        for offset, byte_val in enumerate(code):
-            self.ram.write(base + offset, byte_val & 0xFF)
+        start_page = base >> 4
+        code_end_page = (base + len(code) - 1) >> 4
+        stack_page = (limit - 1) >> 4
+
+        # Lazy allocation: pre-allocate code pages and stack page; other pages fault in on demand
+        prealloc_pages = sorted(set(range(start_page, code_end_page + 1)) | {stack_page})
+
+        if len(self.free_frames) < len(prealloc_pages):
+            raise RuntimeError(
+                f"Out of physical memory: Task '{name}' requires {len(prealloc_pages)} frames at startup, "
+                f"but only {len(self.free_frames)} free frames available."
+            )
+
+        page_table = create_default_page_table()
+        allocated_frames: list[int] = []
+        try:
+            for p in prealloc_pages:
+                frame = self.alloc_frame_for_page(preferred_frame=p)
+                allocated_frames.append(frame)
+                page_table[p] = {"frame": frame, "valid": True}
+        except Exception:
+            for f in allocated_frames:
+                self.free_frame(f)
+            raise
 
         new_id = (
             max(
@@ -431,7 +576,7 @@ class Kernel:
         entry_point = base
         stack_top = limit - 1
 
-        return self.create_task(
+        task_pcb = self.create_task(
             task_id=new_id,
             name=name,
             priority=priority if priority > 0 else 1,
@@ -439,7 +584,14 @@ class Kernel:
             stack_top=stack_top,
             base=base,
             limit=limit,
+            page_table=page_table,
         )
+
+        # Write machine code into RAM at the allocated physical frames
+        for offset, byte_val in enumerate(code):
+            self._write_task_byte(task_pcb, base + offset, byte_val & 0xFF)
+
+        return task_pcb
 
     def pick_next_task_index(self) -> int:
         """Select next task index using the configured scheduler policy."""
@@ -501,6 +653,7 @@ class Kernel:
             # Update CPU hardware memory protection registers
             self.cpu.base_address = incoming["base"]
             self.cpu.limit_address = incoming["limit"]
+            self.cpu.page_table = incoming["page_table"]
 
             # Write incoming task SP into mailbox for assembly ISR trampoline to restore
             self.ram.write(self.MAILBOX_NEW_SP, incoming["task_sp"])
@@ -509,6 +662,7 @@ class Kernel:
             self._is_idle_running = True
             self.cpu.base_address = self.idle_task["base"]
             self.cpu.limit_address = self.idle_task["limit"]
+            self.cpu.page_table = self.idle_task["page_table"]
             self.ram.write(self.MAILBOX_NEW_SP, self.idle_task["task_sp"])
         else:
             # All tasks terminated; halt CPU
@@ -523,6 +677,7 @@ class Kernel:
         self.cpu.registers["SP"] = self.idle_task["task_sp"]
         self.cpu.base_address = self.idle_task["base"]
         self.cpu.limit_address = self.idle_task["limit"]
+        self.cpu.page_table = self.idle_task["page_table"]
         self.cpu.iret()
 
     def multitasking_loop(self, max_steps: int | None = None) -> None:
@@ -541,6 +696,7 @@ class Kernel:
                     self.cpu.registers["SP"] = incoming["task_sp"]
                     self.cpu.base_address = incoming["base"]
                     self.cpu.limit_address = incoming["limit"]
+                    self.cpu.page_table = incoming["page_table"]
                     self.cpu.iret()
 
         steps = 0
@@ -565,8 +721,57 @@ class Kernel:
         """Convenience method to execute the kernel multitasking loop."""
         self.multitasking_loop(max_steps=max_steps)
 
+    def handle_page_fault(self, virtual_addr: int, task: PCB | None = None) -> bool:
+        """Handle a page fault via demand paging within task memory partition."""
+        if task is None:
+            if not self.tasks or not (0 <= self.current_task_index < len(self.tasks)):
+                return False
+            task = self.tasks[self.current_task_index]
+
+        vaddr = virtual_addr & 0xFF
+        base = task["base"]
+        limit = task["limit"]
+
+        # Check bounds: address must be within task partition
+        if not (base <= vaddr < limit):
+            return False
+
+        page = vaddr >> 4
+        pt = task.get("page_table")
+        if pt is None:
+            return False
+
+        entry = pt.get(page)
+        if entry is None:
+            return False
+
+        if entry.get("valid", False):
+            return True
+
+        # Check if physical frame available
+        if not self.free_frames:
+            return False
+
+        frame = self.alloc_frame()
+        # Zero out newly allocated frame memory
+        frame_base = frame << 4
+        for i in range(16):
+            self.ram.write(frame_base + i, 0)
+
+        entry["frame"] = frame
+        entry["valid"] = True
+
+        self.page_fault_count += 1
+        task["page_faults"] = task.get("page_faults", 0) + 1
+        print(
+            f"[Kernel] Page fault handled: Task '{task['task_name']}' (PID {task['task_id']}) "
+            f"mapped virtual page {page} (0x{page << 4:02X}) to physical frame {frame} (0x{frame << 4:02X})"
+        )
+        return True
+
     def handle_fault(self, fault_type: str) -> None:
         """Terminate the offending task and switch to the next available task."""
+        self.last_fault = fault_type
         if self.tasks and 0 <= self.current_task_index < len(self.tasks):
             current_task = self.tasks[self.current_task_index]["task_name"]
             print(f"Fault triggered by {current_task}: {fault_type}")
@@ -586,15 +791,31 @@ class Kernel:
     def handle_syscall(self) -> None:
         """Inspect the stack frame and dispatch the appropriate system call."""
         sp = self.cpu.registers["SP"]
-        syscall_id = self.ram.read(sp + 4)  # ACC holds the syscall ID
-        arg1 = self.ram.read(sp + 3)  # R1 holds argument 1
-        arg2 = self.ram.read(sp + 2)  # R2 holds argument 2
+        current_task = (
+            self.tasks[self.current_task_index]
+            if self.tasks and 0 <= self.current_task_index < len(self.tasks)
+            else None
+        )
+        if current_task is not None:
+            syscall_id = self._read_task_byte(current_task, sp + 4)
+            arg1 = self._read_task_byte(current_task, sp + 3)
+            arg2 = self._read_task_byte(current_task, sp + 2)
+        else:
+            syscall_id = self.ram.read(sp + 4)  # ACC holds the syscall ID
+            arg1 = self.ram.read(sp + 3)  # R1 holds argument 1
+            arg2 = self.ram.read(sp + 2)  # R2 holds argument 2
+
+        def _write_ret(val: int) -> None:
+            if current_task is not None:
+                self._write_task_byte(current_task, sp + 4, val & 0xFF)
+            else:
+                self.ram.write(sp + 4, val & 0xFF)
 
         # Check custom registered syscalls first
         if syscall_id in self.custom_syscalls:
             result = self.custom_syscalls[syscall_id](self, arg1, arg2)
             if result is not None:
-                self.ram.write(sp + 4, result & 0xFF)
+                _write_ret(result)
             self.cpu.iret()
             return
 
@@ -610,27 +831,27 @@ class Kernel:
 
             case self.SYS_GETPID:
                 pid = self.sys_getpid()
-                self.ram.write(sp + 4, pid & 0xFF)
+                _write_ret(pid)
                 self.cpu.iret()
 
             case self.SYS_PRINT_NUM:
                 ret = self.sys_print_num(num=arg1)
-                self.ram.write(sp + 4, ret & 0xFF)
+                _write_ret(ret)
                 self.cpu.iret()
 
             case self.SYS_PRINT_CHAR:
                 ret = self.sys_print_char(char_code=arg1)
-                self.ram.write(sp + 4, ret & 0xFF)
+                _write_ret(ret)
                 self.cpu.iret()
 
             case self.SYS_PRINT_STR:
                 ret = self.sys_print_str(addr=arg1, length=arg2)
-                self.ram.write(sp + 4, ret & 0xFF)
+                _write_ret(ret)
                 self.cpu.iret()
 
             case self.SYS_SPAWN:
                 new_pid = self.sys_spawn(entry_point=arg1, priority=arg2)
-                self.ram.write(sp + 4, new_pid & 0xFF)
+                _write_ret(new_pid)
                 self.cpu.iret()
 
             case self.SYS_WAIT:
@@ -638,17 +859,24 @@ class Kernel:
 
             case self.SYS_KILL:
                 ret = self.sys_kill(target_pid=arg1)
-                self.ram.write(sp + 4, ret & 0xFF)
+                _write_ret(ret)
                 self.cpu.iret()
 
             case self.SYS_GET_TICKS:
                 ticks = self.sys_get_ticks()
-                self.ram.write(sp + 4, ticks & 0xFF)
+                _write_ret(ticks)
                 self.cpu.iret()
 
             case self.SYS_ALLOC:
                 addr = self.sys_alloc(size=arg1)
-                self.ram.write(sp + 4, addr & 0xFF)
+                _write_ret(addr)
+                self.cpu.iret()
+
+            case self.SYS_MUTEX_LOCK:
+                self.sys_mutex_lock(lock_id=arg1)
+
+            case self.SYS_MUTEX_UNLOCK:
+                self.sys_mutex_unlock(lock_id=arg1)
                 self.cpu.iret()
 
             case _:
@@ -679,6 +907,7 @@ class Kernel:
         self.cpu.registers["SP"] = next_task["task_sp"]
         self.cpu.base_address = next_task["base"]
         self.cpu.limit_address = next_task["limit"]
+        self.cpu.page_table = next_task["page_table"]
 
         self.cpu.iret()
 
@@ -692,6 +921,7 @@ class Kernel:
         terminated_task["state"] = TaskState.TERMINATED
         terminated_task["exit_code"] = exit_code
         self.terminated_tasks.append(terminated_task)
+        self.free_task_frames(terminated_task)
 
         print(f"Task {terminated_task['task_name']} exited with code {exit_code}")
 
@@ -704,7 +934,27 @@ class Kernel:
                 task["state"] = TaskState.READY
                 task["wait_pid"] = None
                 # Write exit code into waiting task's saved ACC on its stack
-                self.ram.write(task["task_sp"] + 4, exit_code & 0xFF)
+                self._write_task_byte(task, task["task_sp"] + 4, exit_code & 0xFF)
+
+        # Release any mutexes owned by the exiting task and remove from wait queues
+        for lock_id, lock in self.locks.items():
+            if terminated_task["task_id"] in lock.get("wait_queue", []):
+                lock["wait_queue"].remove(terminated_task["task_id"])
+            if lock.get("owner_pid") == terminated_task["task_id"]:
+                found_waiter = False
+                while lock["wait_queue"]:
+                    next_task_id = lock["wait_queue"].pop(0)
+                    target = next((t for t in self.tasks if t["task_id"] == next_task_id), None)
+                    if target is not None:
+                        target["state"] = TaskState.READY
+                        lock["owner_pid"] = next_task_id
+                        if "locks" in target and lock_id not in target["locks"]:
+                            target["locks"].append(lock_id)
+                        found_waiter = True
+                        break
+                if not found_waiter:
+                    lock["locked"] = False
+                    lock["owner_pid"] = None
 
         if not self.has_active_tasks():
             print("All tasks completed. Halting CPU.")
@@ -722,6 +972,7 @@ class Kernel:
             self.cpu.registers["SP"] = next_task["task_sp"]
             self.cpu.base_address = next_task["base"]
             self.cpu.limit_address = next_task["limit"]
+            self.cpu.page_table = next_task["page_table"]
             self.cpu.iret()
         elif self._any_task_sleeping() and self.idle_task is not None:
             self._switch_to_idle()
@@ -737,7 +988,7 @@ class Kernel:
         current_task["sleep_ticks"] = max(1, ticks)
 
         # Write 0 as return value into saved ACC so waking task receives 0
-        self.ram.write(current_task["task_sp"] + 4, 0x00)
+        self._write_task_byte(current_task, current_task["task_sp"] + 4, 0x00)
 
         # Select next task to run
         next_idx = self.scheduler.pick_next_index(self.tasks, self.current_task_index)
@@ -749,6 +1000,7 @@ class Kernel:
             self.cpu.registers["SP"] = next_task["task_sp"]
             self.cpu.base_address = next_task["base"]
             self.cpu.limit_address = next_task["limit"]
+            self.cpu.page_table = next_task["page_table"]
             self.cpu.iret()
         elif self.idle_task is not None:
             self._switch_to_idle()
@@ -778,20 +1030,40 @@ class Kernel:
     def sys_print_str(self, addr: int, length: int) -> int:
         """Print string from memory, verifying memory protection bounds."""
         current_task = self.tasks[self.current_task_index]
-        base = current_task["base"]
-        limit = current_task["limit"]
+        pt = current_task.get("page_table")
 
-        if not (base <= addr < limit):
-            self.handle_fault("Segmentation Fault: Illegal String Read")
-            return 0xFF
+        if pt is not None and any(entry.get("valid") for entry in pt.values()):
+            page = (addr & 0xFF) >> 4
+            if not pt.get(page, {}).get("valid", False) and not self.handle_page_fault(
+                addr, task=current_task
+            ):
+                self.handle_fault("Segmentation Fault: Illegal String Read")
+                return 0xFF
+        else:
+            base = current_task["base"]
+            limit = current_task["limit"]
+            if not (base <= addr < limit):
+                self.handle_fault("Segmentation Fault: Illegal String Read")
+                return 0xFF
 
         chars: list[str] = []
-        read_len = length if length > 0 else (limit - addr)
+        read_len = length if length > 0 else 256
         for offset in range(read_len):
             cur_addr = addr + offset
-            if cur_addr >= limit:
-                break
-            b = self.ram.read(cur_addr)
+            if pt is not None and any(entry.get("valid") for entry in pt.values()):
+                cur_page = (cur_addr & 0xFF) >> 4
+                entry = pt.get(cur_page)
+                if not entry or not entry.get("valid", False):
+                    if not self.handle_page_fault(cur_addr, task=current_task):
+                        break
+                    entry = pt.get(cur_page)
+                paddr = (entry["frame"] << 4) | (cur_addr & 0x0F)
+            else:
+                if cur_addr >= current_task["limit"]:
+                    break
+                paddr = cur_addr
+
+            b = self.ram.read(paddr)
             if length == 0 and b == 0:  # Null-terminated
                 break
             chars.append(chr(b))
@@ -820,8 +1092,28 @@ class Kernel:
         new_base = highest_limit
         new_limit = new_base + partition_size
 
-        if new_limit > len(self.ram.memory) - 8:  # Reserve space for mailboxes
+        if new_limit > 256:
+            return 0xFF  # Out of virtual address space
+
+        start_page = new_base >> 4
+        entry_page = entry_point >> 4
+        stack_page = (new_limit - 1) >> 4
+        prealloc_pages = sorted(set(range(start_page, entry_page + 1)) | {stack_page})
+
+        if len(self.free_frames) < len(prealloc_pages):
             return 0xFF  # Out of memory
+
+        page_table = create_default_page_table()
+        allocated_frames: list[int] = []
+        try:
+            for p in prealloc_pages:
+                frame = self.alloc_frame_for_page(preferred_frame=p)
+                allocated_frames.append(frame)
+                page_table[p] = {"frame": frame, "valid": True}
+        except Exception:
+            for f in allocated_frames:
+                self.free_frame(f)
+            return 0xFF
 
         new_stack_top = new_limit - 1
         curr_pid = self.sys_getpid()
@@ -834,17 +1126,20 @@ class Kernel:
             base=new_base,
             limit=new_limit,
             parent_id=curr_pid,
+            page_table=page_table,
         )
         return new_id
 
     def sys_wait(self, target_pid: int) -> None:
         """Wait for a target task to terminate and return its exit code."""
+        current_task = self.tasks[self.current_task_index]
+        sp = self.cpu.registers["SP"]
+
         # Check if already terminated
         for term in self.terminated_tasks:
             if term["task_id"] == target_pid:
                 exit_code = term["exit_code"] if term["exit_code"] is not None else 0
-                sp = self.cpu.registers["SP"]
-                self.ram.write(sp + 4, exit_code & 0xFF)
+                self._write_task_byte(current_task, sp + 4, exit_code & 0xFF)
                 self.cpu.iret()
                 return
 
@@ -852,13 +1147,11 @@ class Kernel:
         target = next((t for t in self.tasks if t["task_id"] == target_pid), None)
         if target is None:
             # Target PID does not exist
-            sp = self.cpu.registers["SP"]
-            self.ram.write(sp + 4, 0xFF)
+            self._write_task_byte(current_task, sp + 4, 0xFF)
             self.cpu.iret()
             return
 
         # Block current task until target terminates
-        current_task = self.tasks[self.current_task_index]
         current_task["task_sp"] = self.cpu.registers["SP"]
         current_task["state"] = TaskState.BLOCKED
         current_task["wait_pid"] = target_pid
@@ -873,6 +1166,7 @@ class Kernel:
             self.cpu.registers["SP"] = next_task["task_sp"]
             self.cpu.base_address = next_task["base"]
             self.cpu.limit_address = next_task["limit"]
+            self.cpu.page_table = next_task["page_table"]
             self.cpu.iret()
         elif self.idle_task is not None:
             self._switch_to_idle()
@@ -896,13 +1190,34 @@ class Kernel:
         killed_task["state"] = TaskState.TERMINATED
         killed_task["exit_code"] = 9
         self.terminated_tasks.append(killed_task)
+        self.free_task_frames(killed_task)
 
         # Wake up any task waiting on this PID
         for task in self.tasks:
             if task["state"] == TaskState.BLOCKED and task["wait_pid"] == target_pid:
                 task["state"] = TaskState.READY
                 task["wait_pid"] = None
-                self.ram.write(task["task_sp"] + 4, 9)
+                self._write_task_byte(task, task["task_sp"] + 4, 9)
+
+        # Release any mutexes owned by the killed task and remove from wait queues
+        for lock_id, lock in self.locks.items():
+            if killed_task["task_id"] in lock.get("wait_queue", []):
+                lock["wait_queue"].remove(killed_task["task_id"])
+            if lock.get("owner_pid") == killed_task["task_id"]:
+                found_waiter = False
+                while lock["wait_queue"]:
+                    next_task_id = lock["wait_queue"].pop(0)
+                    target = next((t for t in self.tasks if t["task_id"] == next_task_id), None)
+                    if target is not None:
+                        target["state"] = TaskState.READY
+                        lock["owner_pid"] = next_task_id
+                        if "locks" in target and lock_id not in target["locks"]:
+                            target["locks"].append(lock_id)
+                        found_waiter = True
+                        break
+                if not found_waiter:
+                    lock["locked"] = False
+                    lock["owner_pid"] = None
 
         if target_idx < self.current_task_index:
             self.current_task_index -= 1
@@ -914,15 +1229,154 @@ class Kernel:
         return self.system_ticks & 0xFF
 
     def sys_alloc(self, size: int) -> int:
-        """Allocate heap memory within the task's partition."""
+        """Allocate heap memory, mapping new virtual pages to physical frames."""
+        if size <= 0:
+            return 0
+
         current_task = self.tasks[self.current_task_index]
         heap_start = current_task["heap_ptr"]
-        # Leave at least 10 bytes for stack safety
-        if heap_start + size > current_task["limit"] - 10:
-            return 0  # Allocation failed
+        new_heap_end = heap_start + size
 
-        current_task["heap_ptr"] += size
+        if new_heap_end > current_task["limit"] - 10 or new_heap_end > 256:
+            return 0
+
+        pt = current_task.get("page_table")
+        if pt is not None:
+            start_page = heap_start >> 4
+            end_page = (new_heap_end - 1) >> 4
+            needed = [
+                p for p in range(start_page, end_page + 1) if not pt.get(p, {}).get("valid", False)
+            ]
+
+            if len(needed) > len(self.free_frames):
+                return 0
+
+            allocated: list[tuple[int, int]] = []
+            try:
+                for p in needed:
+                    frame = self.alloc_frame()
+                    allocated.append((p, frame))
+                    pt[p] = {"frame": frame, "valid": True}
+            except Exception:
+                for p, f in allocated:
+                    self.free_frame(f)
+                    pt[p] = {"frame": 0, "valid": False}
+                return 0
+
+        current_task["heap_ptr"] = new_heap_end
         return heap_start
+
+    def get_held_locks(self, pid: int | None = None) -> list[int]:
+        """Return a sorted list of lock IDs currently held by the specified task PID."""
+        target_pid = self.sys_getpid() if pid is None else pid
+        return sorted(
+            lid
+            for lid, ldata in self.locks.items()
+            if ldata.get("owner_pid") == target_pid and ldata.get("locked")
+        )
+
+    def can_acquire_lock(self, lock_id: int, pid: int | None = None) -> bool:
+        """Check if lock_id is strictly greater than all locks currently owned by the task."""
+        held = self.get_held_locks(pid)
+        return not held or lock_id > max(held)
+
+    def sys_mutex_lock(self, lock_id: int) -> None:
+        """Acquire a mutex lock. Block task and reschedule if lock is already taken."""
+        if not self.tasks or not (0 <= self.current_task_index < len(self.tasks)):
+            return
+
+        current_task = self.tasks[self.current_task_index]
+        current_pid = self.sys_getpid()
+
+        # 🔍 Check: The kernel looks at all the locks this task currently holds.
+        held_locks = self.get_held_locks(current_pid)
+
+        # 📏 Condition: The new_lock_id must be strictly greater (>) than any lock the task already owns.
+        # 🛑 Violation: If the task tries to acquire a lock with a smaller or equal number, it breaks the rule!
+        if any(lock_id <= lid for lid in held_locks):
+            self.handle_fault(
+                f"Lock Ordering Violation: Task {current_pid} attempted to acquire lock {lock_id} "
+                f"while holding lock(s) {held_locks} (must be strictly greater)"
+            )
+            return
+
+        if lock_id not in self.locks:
+            self.locks[lock_id] = {
+                "locked": False,
+                "owner_pid": None,
+                "wait_queue": [],
+            }
+
+        lock = self.locks[lock_id]
+
+        # If the lock is free:
+        if not lock["locked"]:
+            lock["locked"] = True
+            lock["owner_pid"] = current_pid
+            if "locks" in current_task and lock_id not in current_task["locks"]:
+                current_task["locks"].append(lock_id)
+            self.cpu.iret()
+            return
+
+        # If the lock is already taken:
+        lock["wait_queue"].append(current_pid)
+        current_task["task_sp"] = self.cpu.registers["SP"]
+        current_task["state"] = TaskState.BLOCKED
+
+        # Call the scheduler to run another task
+        next_idx = self.scheduler.pick_next_index(self.tasks, self.current_task_index)
+        if next_idx is not None:
+            self._is_idle_running = False
+            self.current_task_index = next_idx
+            next_task = self.tasks[self.current_task_index]
+            next_task["state"] = TaskState.RUNNING
+
+            self.cpu.registers["SP"] = next_task["task_sp"]
+            self.cpu.base_address = next_task["base"]
+            self.cpu.limit_address = next_task["limit"]
+            self.cpu.page_table = next_task["page_table"]
+            self.cpu.iret()
+        elif self.idle_task is not None:
+            self._switch_to_idle()
+        else:
+            self.cpu.halt()
+
+    def sys_mutex_unlock(self, lock_id: int) -> None:
+        """Release a mutex lock. Wake up the next waiting task if any."""
+        if not self.tasks or not (0 <= self.current_task_index < len(self.tasks)):
+            return
+
+        if lock_id not in self.locks:
+            return
+
+        lock = self.locks[lock_id]
+        current_pid = self.sys_getpid()
+        current_task = self.tasks[self.current_task_index]
+
+        # Check that the caller is the owner_pid
+        if lock["owner_pid"] != current_pid:
+            return
+
+        if "locks" in current_task and lock_id in current_task["locks"]:
+            current_task["locks"].remove(lock_id)
+
+        # If wait_queue has waiting tasks:
+        found_waiter = False
+        while lock["wait_queue"]:
+            next_task_id = lock["wait_queue"].pop(0)
+            target = next((t for t in self.tasks if t["task_id"] == next_task_id), None)
+            if target is not None:
+                target["state"] = TaskState.READY
+                lock["owner_pid"] = next_task_id
+                if "locks" in target and lock_id not in target["locks"]:
+                    target["locks"].append(lock_id)
+                found_waiter = True
+                break
+
+        if not found_waiter:
+            # If the queue is empty:
+            lock["locked"] = False
+            lock["owner_pid"] = None
 
     def get_console_output(self) -> str:
         """Return concatenated console output produced by system calls."""
@@ -944,6 +1398,7 @@ class Kernel:
         self.cpu.registers["SP"] = first_task["task_sp"]
         self.cpu.base_address = first_task["base"]
         self.cpu.limit_address = first_task["limit"]
+        self.cpu.page_table = first_task["page_table"]
         self.cpu.halted = False
 
         self.cpu.iret()  # Unpacks forged context into registers

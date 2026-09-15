@@ -37,6 +37,12 @@ class PrivilegeViolationFault(CPUFault):
     pass
 
 
+class PageFault(CPUFault):
+    """Raised when an instruction accesses an unmapped or invalid virtual page."""
+
+    pass
+
+
 class _FetchFault(CPUFault):
     """Internal signal to cleanly abort the current instruction cycle."""
 
@@ -78,8 +84,10 @@ class CPU:
         self.syscall_handler: Callable | None = None
         self.kernel_mode: bool = True
         self.fault_handler: Callable | None = None
+        self.page_fault_handler: Callable[[int], bool] | None = None
         self.base_address: int = 0
         self.limit_address: int = len(self.ram.memory)
+        self.page_table: dict[int, dict] | None = None
 
     def _validate_register(self, reg: str, allow_acc_pc: bool = False) -> None:
         allowed = self.VALID_REGISTERS if allow_acc_pc else self.VALID_GP_REGISTERS
@@ -95,11 +103,11 @@ class CPU:
         self.flags["Z"] = self.registers["ACC"] == 0
 
     def load(self, address: int) -> None:
-        """Load byte from RAM address into Accumulator and update Zero flag."""
-        if not self._validate_memory_read(address):
+        """Load byte from RAM address into Accumulator with fault guard."""
+        phys_addr = self.translate_address(address, access_type="read")
+        if phys_addr is None:
             return
-
-        val = self.ram.read(address) & 0xFF
+        val = self.ram.read(phys_addr) & 0xFF
         self.registers["ACC"] = val
         self.flags["Z"] = val == 0
 
@@ -109,10 +117,11 @@ class CPU:
         self.flags["Z"] = value == 0
 
     def store(self, address: int) -> None:
-        """Store Accumulator value into RAM address."""
-        if not self._validate_memory_write(address):
+        """Store Accumulator byte into RAM address with fault guard."""
+        phys_addr = self.translate_address(address, access_type="write")
+        if phys_addr is None:
             return
-        self.ram.write(address, self.registers["ACC"] & 0xFF)
+        self.ram.write(phys_addr, self.registers["ACC"] & 0xFF)
 
     def mov(self, dest: str, src: str) -> None:
         """Copy value between valid registers."""
@@ -190,28 +199,54 @@ class CPU:
 
     def push(self, value: int) -> None:
         """Push value onto the stack."""
-        if not self._validate_memory_write(self.registers["SP"]):
+        sp = self.registers["SP"]
+        phys_addr = self.translate_address(sp, access_type="write", force=True)
+        if phys_addr is None:
             return
-        self.ram.write(self.registers["SP"], value & 0xFF)
+
+        self.ram.write(phys_addr, value & 0xFF)
         self.registers["SP"] -= 1
 
     def pop(self) -> int:
         """Pop value from the stack with bounds checking."""
         target_address = self.registers["SP"] + 1
-        if not self._validate_memory_read(target_address):
+        phys_addr = self.translate_address(target_address, access_type="read", force=True)
+        if phys_addr is None:
             return 0
 
         self.registers["SP"] = target_address
-        return self.ram.read(self.registers["SP"]) & 0xFF
+        return self.ram.read(phys_addr) & 0xFF
 
     def interrupt(self, vector_address: int) -> None:
         """Save CPU state, flags, and jump to the interrupt service routine."""
         # Check for stack overflow/violation when in User Mode
         if not self.kernel_mode:
-            stack_in_bounds = (
-                self.base_address <= (self.registers["SP"] - 4)
-                and self.registers["SP"] < self.limit_address
-            )
+            if self.page_table is not None and any(
+                e.get("valid") for e in self.page_table.values()
+            ):
+                sp = self.registers["SP"]
+                sp_start_page = ((sp - 4) & 0xFF) >> 4
+                sp_end_page = (sp & 0xFF) >> 4
+                start_entry = self.page_table.get(sp_start_page)
+                end_entry = self.page_table.get(sp_end_page)
+                if (start_entry is None or not start_entry.get("valid", False)) and self.page_fault_handler:
+                    self.page_fault_handler((sp - 4) & 0xFF)
+                    start_entry = self.page_table.get(sp_start_page)
+                if (end_entry is None or not end_entry.get("valid", False)) and self.page_fault_handler:
+                    self.page_fault_handler(sp & 0xFF)
+                    end_entry = self.page_table.get(sp_end_page)
+                stack_in_bounds = (
+                    0 <= (sp - 4) <= sp <= 0xFF
+                    and start_entry is not None
+                    and start_entry.get("valid", False)
+                    and end_entry is not None
+                    and end_entry.get("valid", False)
+                )
+            else:
+                stack_in_bounds = (
+                    self.base_address <= (self.registers["SP"] - 4)
+                    and self.registers["SP"] < self.limit_address
+                )
             if not stack_in_bounds:
                 self.kernel_mode = True  # Elevate so fault handling runs safely
                 if self.fault_handler:
@@ -258,40 +293,67 @@ class CPU:
 
     def _fetch_byte(self) -> int:
         """Fetch byte at PC from RAM if within bounds; advance PC."""
-        if not self._validate_pc():
+        phys_addr = self.translate_address(self.registers["PC"], access_type="fetch")
+        if phys_addr is None:
             raise _FetchFault()
 
-        byte = self.ram.read(self.registers["PC"])
+        byte = self.ram.read(phys_addr)
         self.registers["PC"] += 1
         return byte
 
+    def translate_address(
+        self, virtual_addr: int, access_type: str = "read", force: bool = False
+    ) -> int | None:
+        """Translate virtual address to physical RAM address with MMU validation; returns None on fault."""
+        if not force and getattr(self, "kernel_mode", False):
+            return virtual_addr
+
+        if self.page_table is not None and any(e.get("valid") for e in self.page_table.values()):
+            page = (virtual_addr & 0xFF) >> 4
+            offset = virtual_addr & 0x0F
+            entry = self.page_table.get(page)
+
+            if not entry or not entry.get("valid", False):
+                if self.page_fault_handler and self.page_fault_handler(virtual_addr):
+                    entry = self.page_table.get(page)
+                else:
+                    if self.fault_handler:
+                        self.fault_handler(
+                            f"Page Fault: Invalid virtual address 0x{virtual_addr & 0xFF:02X}"
+                        )
+                        return None
+                    raise PageFault(
+                        f"Page Fault: Invalid virtual address 0x{virtual_addr & 0xFF:02X}"
+                    )
+
+            if not entry or not entry.get("valid", False):
+                return None
+
+            return (entry["frame"] << 4) | offset
+
+        # Legacy Base/Limit MPU bounds fallback
+        if self.base_address <= virtual_addr < self.limit_address:
+            return virtual_addr
+
+        fault_messages = {
+            "write": "Segmentation Fault: Illegal Memory Write",
+            "read": "Segmentation Fault: Illegal Memory Read",
+            "fetch": "Segmentation Fault: Illegal Instruction Fetch",
+        }
+        fault_msg = fault_messages.get(access_type, "Segmentation Fault")
+        if self.fault_handler:
+            self.fault_handler(fault_msg)
+        else:
+            raise PrivilegeViolationFault(fault_msg)
+        return None
+
     def _validate_memory_write(self, address: int) -> bool:
         """Ensure User Mode programs cannot overwrite protected kernel memory."""
-        # Fast path: kernel mode has full access, user mode is restricted to [0x40, 0xFA)
-        if self.kernel_mode or (self.base_address <= address < self.limit_address):
-            return True
-
-        # Violation path: handle fault
-        if self.fault_handler:
-            self.fault_handler("Segmentation Fault: Illegal Memory Write")
-        else:
-            raise PrivilegeViolationFault(f"Access violation at address {hex(address)}")
-
-        return False
+        return self.translate_address(address, access_type="write") is not None
 
     def _validate_memory_read(self, address: int) -> bool:
         """Ensure User Mode programs cannot read outside their memory bounds."""
-        # Fast path: kernel mode has full access; user mode must stay within bounds
-        if self.kernel_mode or (self.base_address <= address < self.limit_address):
-            return True
-
-        # Violation path: report fault
-        if self.fault_handler:
-            self.fault_handler("Segmentation Fault: Illegal Memory Read")
-        else:
-            raise PrivilegeViolationFault(f"Illegal memory read at address {hex(address)}")
-
-        return False
+        return self.translate_address(address, access_type="read") is not None
 
     def _require_kernel_mode(self) -> bool:
         """Ensure CPU is in Kernel Mode; trigger fault and abort if in User Mode."""
@@ -305,15 +367,7 @@ class CPU:
 
     def _validate_pc(self) -> bool:
         """Ensure User Mode execution remains strictly within memory bounds."""
-        if self.kernel_mode or (self.base_address <= self.registers["PC"] < self.limit_address):
-            return True
-
-        if self.fault_handler:
-            self.fault_handler("Segmentation Fault: Illegal Instruction Fetch")
-        else:
-            raise PrivilegeViolationFault(f"Fetch out of bounds at {hex(self.registers['PC'])}")
-
-        return False
+        return self.translate_address(self.registers["PC"], access_type="fetch") is not None
 
     def step(self) -> None:
         """Fetch, decode, and execute a single instruction."""

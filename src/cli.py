@@ -1,15 +1,19 @@
-"""Interactive CLI and OS simulator emulator with startup animation and shell."""
+"""Interactive CLI and OS simulator emulator with startup animation, shell, and live dashboard."""
 
 from __future__ import annotations
 
+import select
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.prompt import Prompt
@@ -34,6 +38,13 @@ from src.demos import (
 )
 from src.kernel import PCB, Kernel, TaskState
 from src.ram import RAM
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # ty: ignore[invalid-assignment]
+    tty = None  # type: ignore[assignment]
 
 console = Console()
 app = typer.Typer(
@@ -74,6 +85,42 @@ def typewriter_text(
     target_console.print()
 
 
+class RawTerminalContext:
+    """Context manager to put standard input in cbreak mode and restore on exit."""
+
+    def __enter__(self):
+        if sys.stdin.isatty() and termios is not None and tty is not None:
+            self.fd = sys.stdin.fileno()
+            self.old_settings = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        else:
+            self.fd = None
+            self.old_settings = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd is not None and self.old_settings is not None and termios is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+
+def get_key(timeout: float = 0.1) -> str | None:
+    """Non-blocking read of a single key from standard input."""
+    if not sys.stdin.isatty() or sys.platform == "win32":
+        return None
+    rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+    if rlist:
+        try:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                r2, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if r2:
+                    sys.stdin.read(2)
+            return ch
+        except Exception:
+            return None
+    return None
+
+
 class OSSimulatorSession:
     """Encapsulates the state and operations of an active OS simulation session."""
 
@@ -86,6 +133,19 @@ class OSSimulatorSession:
         self.bootloader = Bootloader(self.ram, self.cpu, self.kernel)
         self.is_booted: bool = False
         self.is_started: bool = False
+        self.execution_log: list[str] = []
+
+    def reboot_clean(self) -> None:
+        """Reset hardware state cleanly without animations."""
+        self.ram = RAM(256)
+        self.cpu = CPU(self.ram)
+        self.kernel = Kernel(self.ram, self.cpu)
+        self.bootloader = Bootloader(self.ram, self.cpu, self.kernel)
+        self.is_booted = True
+        self.is_started = False
+        self.execution_log.clear()
+        self.bootloader.load_ivt()
+        self.kernel.install_isr()
 
     def _sleep(self, seconds: float) -> None:
         """Helper to sleep taking speed multiplier and animation flag into account."""
@@ -121,10 +181,14 @@ class OSSimulatorSession:
             ("Setting Up Kernel Memory Bounds", "Protected Range [0x00 - 0x3F] Locked [OK]"),
         ]
 
-        console.print("[bold yellow]>>> Initiating Hardware Power-On Self-Test (POST)...[/bold yellow]")
+        console.print(
+            "[bold yellow]>>> Initiating Hardware Power-On Self-Test (POST)...[/bold yellow]"
+        )
         for stage, status in post_checks:
             self._sleep(0.08)
-            console.print(f"  [bold blue]•[/bold blue] {stage:<42} [bold green]{status}[/bold green]")
+            console.print(
+                f"  [bold blue]•[/bold blue] {stage:<42} [bold green]{status}[/bold green]"
+            )
 
         # Run bootstrapping progress animation
         boot_msg = custom_text if custom_text else "OS-SIM Operating System Ready"
@@ -172,7 +236,9 @@ class OSSimulatorSession:
         self.is_booted = True
 
         self._sleep(0.2)
-        console.print("\n[bold green]✓ Operating System successfully booted into interactive mode![/bold green]\n")
+        console.print(
+            "\n[bold green]✓ Operating System successfully booted into interactive mode![/bold green]\n"
+        )
 
     def show_status(self) -> None:
         """Display summary table of the OS state."""
@@ -182,49 +248,359 @@ class OSSimulatorSession:
 
         table.add_row("CPU Architecture", "8-bit Accumulator with GP Registers (R1, R2)")
         table.add_row("Execution Privilege", "KERNEL MODE" if self.cpu.kernel_mode else "USER MODE")
-        table.add_row("CPU Status", "[bold red]HALTED[/bold red]" if self.cpu.halted else "[bold green]ACTIVE[/bold green]")
+        table.add_row(
+            "CPU Status",
+            "[bold red]HALTED[/bold red]" if self.cpu.halted else "[bold green]ACTIVE[/bold green]",
+        )
         table.add_row("CPU Cycles", str(self.cpu.cycle_count))
         table.add_row("System Ticks", str(self.kernel.system_ticks))
         table.add_row("Total RAM", f"{len(self.ram.memory)} Bytes")
-        table.add_row("Active Tasks", str(len([t for t in self.kernel.tasks if t['state'] != TaskState.TERMINATED])))
+        table.add_row(
+            "Active Tasks",
+            str(len([t for t in self.kernel.tasks if t["state"] != TaskState.TERMINATED])),
+        )
         table.add_row("Terminated Tasks", str(len(self.kernel.terminated_tasks)))
         table.add_row("Scheduler Policy", self.kernel.scheduler.policy.value)
         console.print(table)
 
-    def show_cpu(self) -> None:
-        """Display detailed CPU registers, flags, and memory bounds."""
-        reg_table = Table(title="CPU Register State", border_style="green")
-        reg_table.add_column("Register", style="bold cyan")
-        reg_table.add_column("Hex", style="bold yellow")
-        reg_table.add_column("Decimal", style="bold white")
-        reg_table.add_column("Binary", style="dim")
+    def get_cpu_context_table(self, compact: bool = False) -> Table:
+        """Construct rich Table representing CPU execution state, mode, task, and PC."""
+        title = "CPU Execution Context" if not compact else "CPU Context"
+        status_table = Table(title=title, border_style="cyan", show_header=not compact)
+        status_table.add_column("Property", style="bold cyan")
+        status_table.add_column("Value", style="bold white")
+        if not compact:
+            status_table.add_column("Details", style="dim")
 
-        for reg, val in self.cpu.registers.items():
-            reg_table.add_row(
+        state_str = (
+            "[bold red]HALTED[/bold red]" if self.cpu.halted else "[bold green]ACTIVE[/bold green]"
+        )
+        if compact:
+            status_table.add_row(
+                "State / Mode",
+                f"{state_str} | {'[bold yellow]Kernel[/bold yellow]' if self.cpu.kernel_mode else '[bold green]User[/bold green]'}",
+            )
+        else:
+            status_table.add_row("CPU State", state_str, f"Halted Flag: {self.cpu.halted}")
+            status_table.add_row(
+                "Privilege Mode",
+                "[bold yellow]Kernel Mode[/bold yellow]"
+                if self.cpu.kernel_mode
+                else "[bold green]User Mode[/bold green]",
+                "Direct physical RAM access"
+                if self.cpu.kernel_mode
+                else "Virtual Memory MMU enforcement",
+            )
+
+        curr_task = (
+            self.kernel.tasks[self.kernel.current_task_index]
+            if self.kernel.tasks and 0 <= self.kernel.current_task_index < len(self.kernel.tasks)
+            else None
+        )
+        if curr_task is not None:
+            task_info = f"{curr_task['task_name']} (PID {curr_task['task_id']})"
+            task_detail = f"Priority {curr_task['priority']} | State: {curr_task['state'].value} | Partition: [0x{curr_task['base']:02X}, 0x{curr_task['limit']:02X})"
+        elif self.kernel._is_idle_running and self.kernel.idle_task:
+            task_info = "[dim]Idle Task (PID 255)[/dim]"
+            task_detail = "Executing kernel idle loop"
+        else:
+            task_info = "[dim]None (Bootstrap / Stopped)[/dim]"
+            task_detail = "No active user task scheduled"
+
+        if compact:
+            status_table.add_row("Task", task_info)
+            status_table.add_row(
+                "Cycle",
+                f"{self.cpu.cycle_count}/{CPU.TIMER_INTERRUPT_CYCLE_COUNT} (Tot: {self.kernel.total_cycles})",
+            )
+        else:
+            status_table.add_row("Current Task", task_info, task_detail)
+            status_table.add_row(
+                "Cycle Counter",
+                f"{self.cpu.cycle_count} / {CPU.TIMER_INTERRUPT_CYCLE_COUNT}",
+                f"Preemption interrupt in {CPU.TIMER_INTERRUPT_CYCLE_COUNT - self.cpu.cycle_count} cycles (Total: {self.kernel.total_cycles})",
+            )
+            status_table.add_row(
+                "Interrupts",
+                "ENABLED" if self.cpu.interrupts_enabled else "DISABLED",
+                f"Pending Queue: {len(self.cpu.interrupt_queue)} vectors {self.cpu.interrupt_queue}",
+            )
+
+        pc_val = self.cpu.registers["PC"]
+        phys_pc = self.cpu.translate_address(pc_val, access_type="fetch", force=True)
+        if phys_pc is not None and 0 <= phys_pc < len(self.ram.memory):
+            next_bytes = [
+                self.ram.read(min(phys_pc + i, len(self.ram.memory) - 1)) for i in range(2)
+            ]
+            dis = disassemble(next_bytes, origin=pc_val)
+            ins_str = f"{dis[0].mnemonic} {dis[0].operands}".strip() if dis else "Unknown"
+        else:
+            ins_str = "[red]Unmapped / Invalid[/red]"
+
+        pc_page = (pc_val & 0xFF) >> 4
+        pt = self.cpu.page_table or {}
+        entry = pt.get(pc_page, {})
+        if self.cpu.kernel_mode:
+            exec_frame_str = f"Kernel Frame {phys_pc >> 4}" if phys_pc is not None else "Invalid"
+        else:
+            exec_frame_str = (
+                f"Frame {entry.get('frame', '-')}"
+                if entry.get("valid") and phys_pc is not None
+                else f"Phys 0x{phys_pc:02X}"
+                if phys_pc is not None
+                else "[red]Unmapped[/red]"
+            )
+
+        if compact:
+            status_table.add_row("PC -> Frame", f"0x{pc_val:02X} -> {exec_frame_str}")
+            status_table.add_row("Next Ins", ins_str)
+            status_table.add_row(
+                "ALU Flags",
+                f"Z: [bold cyan]{int(self.cpu.flags['Z'])}[/bold cyan] | C: [bold cyan]{int(self.cpu.flags['C'])}[/bold cyan]",
+            )
+        else:
+            status_table.add_row(
+                "Executing Frame / PC",
+                f"Virtual 0x{pc_val:02X} -> {exec_frame_str}",
+                f"Next Instruction: {ins_str}",
+            )
+
+        return status_table
+
+    def get_registers_table(self, compact: bool = False) -> Table:
+        """Construct rich Table representing CPU register state."""
+        reg_table = Table(title="CPU Register State", border_style="green")
+        reg_table.add_column("Reg", style="bold cyan")
+        reg_table.add_column("Hex", style="bold yellow")
+        reg_table.add_column("Dec", style="bold white")
+        reg_table.add_column("Binary", style="dim")
+        reg_table.add_column("Physical Mapping", style="magenta")
+        if not compact:
+            reg_table.add_column("Function / Role", style="dim")
+
+        roles = {
+            "ACC": "Accumulator (ALU target, Syscall ID & Return Value)",
+            "R1": "General Purpose 1 (Syscall Arg 1)",
+            "R2": "General Purpose 2 (Syscall Arg 2)",
+            "PC": "Program Counter (Next Instruction Address)",
+            "SP": "Stack Pointer (Decrements on push, increments on pop)",
+        }
+
+        reg_order = ["ACC", "R1", "R2", "PC", "SP"]
+        sorted_regs = sorted(
+            self.cpu.registers.keys(), key=lambda r: reg_order.index(r) if r in reg_order else 99
+        )
+        for reg in sorted_regs:
+            val = self.cpu.registers[reg]
+            phys_mapping = "-"
+            if reg == "PC":
+                p = self.cpu.translate_address(val, access_type="fetch", force=True)
+                phys_mapping = (
+                    f"Phys 0x{p:02X} (Frame {p >> 4})" if p is not None else "[red]Fault[/red]"
+                )
+            elif reg == "SP":
+                p = self.cpu.translate_address(val, access_type="write", force=True)
+                phys_mapping = (
+                    f"Phys 0x{p:02X} (Frame {p >> 4})" if p is not None else "[red]Fault[/red]"
+                )
+
+            row = [
                 reg,
                 f"0x{val:02X}",
                 str(val),
-                f"{val:08b}" if reg != "PC" else f"{val:016b}",
-            )
-        console.print(reg_table)
+                f"{val:08b}",
+                phys_mapping,
+            ]
+            if not compact:
+                row.append(roles.get(reg, "-"))
+            reg_table.add_row(*row)
 
+        return reg_table
+
+    def get_flags_table(self) -> Table:
+        """Construct rich Table representing ALU Zero and Carry status flags."""
         flag_table = Table(title="ALU Status Flags", border_style="magenta")
         flag_table.add_column("Flag", style="bold cyan")
         flag_table.add_column("Status", style="bold white")
         flag_table.add_column("Meaning", style="dim")
+        flag_table.add_row(
+            "Z (Zero)",
+            "1 (TRUE)" if self.cpu.flags["Z"] else "0 (FALSE)",
+            "Set when ALU result is 0 (Used for JZ branching)",
+        )
+        flag_table.add_row(
+            "C (Carry)",
+            "1 (TRUE)" if self.cpu.flags["C"] else "0 (FALSE)",
+            "Set on arithmetic overflow (>255) or underflow (<0)",
+        )
+        return flag_table
 
-        flag_table.add_row("Z (Zero)", "1 (TRUE)" if self.cpu.flags["Z"] else "0 (FALSE)", "Set when ALU result is 0")
-        flag_table.add_row("C (Carry)", "1 (TRUE)" if self.cpu.flags["C"] else "0 (FALSE)", "Set on ALU arithmetic overflow/underflow")
-        console.print(flag_table)
+    def get_mmu_table(self, compact: bool = False) -> Table:
+        """Construct rich Table representing MMU page table and physical frame mappings."""
+        active_pt = self.cpu.page_table or {}
+        pc_page = (self.cpu.registers["PC"] & 0xFF) >> 4
+        sp_page = (self.cpu.registers["SP"] & 0xFF) >> 4
+        curr_task = (
+            self.kernel.tasks[self.kernel.current_task_index]
+            if self.kernel.tasks and 0 <= self.kernel.current_task_index < len(self.kernel.tasks)
+            else None
+        )
 
-        bounds_table = Table(title="Hardware Memory Protection Unit (MPU)", border_style="yellow")
-        bounds_table.add_column("Property", style="bold cyan")
-        bounds_table.add_column("Value", style="bold white")
-        bounds_table.add_row("Base Address", f"0x{self.cpu.base_address:02X} ({self.cpu.base_address})")
-        bounds_table.add_row("Limit Address", f"0x{self.cpu.limit_address:02X} ({self.cpu.limit_address})")
-        bounds_table.add_row("Kernel Mode", str(self.cpu.kernel_mode))
-        bounds_table.add_row("Interrupts Enabled", str(self.cpu.interrupts_enabled))
-        console.print(bounds_table)
+        if not compact:
+            mmu_table = Table(
+                title="Virtual Memory & Page Table Mapping (MMU)", border_style="yellow"
+            )
+            mmu_table.add_column("Page", justify="right", style="bold cyan")
+            mmu_table.add_column("Virtual Range", style="bold yellow")
+            mmu_table.add_column("Physical Frame", justify="right", style="bold green")
+            mmu_table.add_column("Physical Range", style="white")
+            mmu_table.add_column("Status", style="bold")
+            mmu_table.add_column("Active Usage / Segment", style="dim")
+
+            for p in range(16):
+                v_start = p << 4
+                v_end = v_start + 15
+                v_range = f"0x{v_start:02X}-0x{v_end:02X}"
+
+                entry = active_pt.get(p)
+                if entry and entry.get("valid"):
+                    frame = entry["frame"]
+                    p_start = frame << 4
+                    p_end = p_start + 15
+                    p_range = f"0x{p_start:02X}-0x{p_end:02X}"
+                    status = "[bold green]MAPPED[/bold green]"
+
+                    tags = []
+                    if p < 4:
+                        tags.append("Kernel Reserved")
+                    if p == pc_page:
+                        tags.append("[bold yellow]EXECUTING (PC)[/bold yellow]")
+                    if p == sp_page:
+                        tags.append("[cyan]STACK (SP)[/cyan]")
+                    if (
+                        curr_task
+                        and (curr_task["base"] >> 4) <= p <= ((curr_task["limit"] - 1) >> 4)
+                        and not tags
+                    ):
+                        tags.append("Task Partition")
+                    usage = " | ".join(tags) if tags else "User Memory"
+                    frame_str = str(frame)
+                else:
+                    p_range = "-"
+                    frame_str = "-"
+                    if curr_task and (curr_task["base"] >> 4) <= p <= (
+                        (curr_task["limit"] - 1) >> 4
+                    ):
+                        status = "[yellow]UNMAPPED (Demand)[/yellow]"
+                        usage = "Task Virtual Space (Fault on Access)"
+                    elif p < 4:
+                        status = "[dim]Kernel Region[/dim]"
+                        usage = "Kernel Low Memory"
+                    elif p == 15:
+                        status = "[dim]Mailbox / High RAM[/dim]"
+                        usage = "Mailbox & System Buffer"
+                    else:
+                        status = "[dim]UNMAPPED[/dim]"
+                        usage = "-"
+
+                mmu_table.add_row(f"{p}", v_range, frame_str, p_range, status, usage)
+            return mmu_table
+
+        # Dual-column compact 8-row MMU table for live inspector panel
+        mmu_table = Table(
+            title="MMU Page Table (16 Pages -> Physical Frames)",
+            border_style="yellow",
+            padding=(0, 1),
+        )
+        mmu_table.add_column("P", justify="right", style="bold cyan")
+        mmu_table.add_column("Virt", style="bold yellow")
+        mmu_table.add_column("Frm", justify="right", style="bold green")
+        mmu_table.add_column("Status", style="bold")
+        mmu_table.add_column("Tag", style="dim")
+        mmu_table.add_column("│", justify="center", style="dim")
+        mmu_table.add_column("P", justify="right", style="bold cyan")
+        mmu_table.add_column("Virt", style="bold yellow")
+        mmu_table.add_column("Frm", justify="right", style="bold green")
+        mmu_table.add_column("Status", style="bold")
+        mmu_table.add_column("Tag", style="dim")
+
+        def cell_info(pg: int) -> tuple[str, str, str, str, str]:
+            v_str = f"0x{pg << 4:02X}"
+            entry = active_pt.get(pg)
+            if entry and entry.get("valid"):
+                frm = str(entry["frame"])
+                st = "[green]MAP[/green]"
+                if pg == pc_page:
+                    tg = "[bold yellow]EXEC[/bold yellow]"
+                elif pg == sp_page:
+                    tg = "[cyan]STK[/cyan]"
+                elif pg < 4:
+                    tg = "KRN"
+                else:
+                    tg = "TASK"
+            else:
+                frm = "-"
+                if curr_task and (curr_task["base"] >> 4) <= pg <= ((curr_task["limit"] - 1) >> 4):
+                    st = "[yellow]DEM[/yellow]"
+                    tg = "DEM"
+                elif pg < 4:
+                    st = "[dim]KRN[/dim]"
+                    tg = "LOW"
+                elif pg == 15:
+                    st = "[dim]BOX[/dim]"
+                    tg = "MBOX"
+                else:
+                    st = "[dim]UNM[/dim]"
+                    tg = "-"
+            return (str(pg), v_str, frm, st, tg)
+
+        for row in range(8):
+            p_left = row
+            p_right = row + 8
+            l_p, l_v, l_f, l_s, l_t = cell_info(p_left)
+            r_p, r_v, r_f, r_s, r_t = cell_info(p_right)
+            mmu_table.add_row(l_p, l_v, l_f, l_s, l_t, "│", r_p, r_v, r_f, r_s, r_t)
+
+        return mmu_table
+
+    def get_frame_pool_summary(self) -> Text:
+        """Construct Text summary of free physical frames and page fault counts."""
+        curr_task = (
+            self.kernel.tasks[self.kernel.current_task_index]
+            if self.kernel.tasks and 0 <= self.kernel.current_task_index < len(self.kernel.tasks)
+            else None
+        )
+        free_frames = self.kernel.free_frames
+        task_faults = curr_task.get("page_faults", 0) if curr_task else 0
+        return Text.from_markup(
+            f"[dim]Frame Pool: [bold green]{len(free_frames)}[/bold green] free {free_frames} | "
+            f"Faults: Kernel [bold yellow]{self.kernel.page_fault_count}[/bold yellow], Task [bold cyan]{task_faults}[/bold cyan][/dim]"
+        )
+
+    def get_right_inspector_panel(self, compact: bool = True) -> Panel:
+        """Combine execution context, registers, ALU flags, and MMU table into right inspector."""
+        items = [
+            self.get_cpu_context_table(compact=compact),
+            self.get_registers_table(compact=compact),
+        ]
+        if not compact:
+            items.append(self.get_flags_table())
+        items.append(self.get_mmu_table(compact=compact))
+        items.append(self.get_frame_pool_summary())
+        return Panel(
+            Group(*items),
+            title="[bold cyan]CPU & MMU Live Inspector[/bold cyan]",
+            border_style="cyan",
+        )
+
+    def show_cpu(self) -> None:
+        """Display detailed CPU registers, flags, execution status, and MMU/frame mapping."""
+        console.print(self.get_cpu_context_table(compact=False))
+        console.print(self.get_registers_table(compact=False))
+        console.print(self.get_flags_table())
+        console.print(self.get_mmu_table(compact=False))
+        console.print(self.get_frame_pool_summary())
+        console.print()
 
     def show_memory(self, start: int = 0, length: int = 256) -> None:
         """Display colored hex dump of RAM."""
@@ -263,7 +639,9 @@ class OSSimulatorSession:
                     elif addr >= 0xFC:
                         row_vals.append(f"[dim red]{b:02X}[/dim red]")
                     else:
-                        row_vals.append(f"[green]{b:02X}[/green]" if b != 0 else f"[dim]{b:02X}[/dim]")
+                        row_vals.append(
+                            f"[green]{b:02X}[/green]" if b != 0 else f"[dim]{b:02X}[/dim]"
+                        )
 
                     ascii_chars.append(chr(b) if 32 <= b <= 126 else ".")
                 else:
@@ -285,7 +663,9 @@ class OSSimulatorSession:
             table.add_row(f"0x{row_base:02X}:", *row_vals, "".join(ascii_chars), tag)
 
         console.print(table)
-        console.print("[dim]Regions: [cyan]IVT (0x00-1F)[/cyan] | [magenta]ISR (0x20-2F)[/magenta] | [blue]Idle (0x30-3F)[/blue] | [green]User (0x40-F9)[/green] | [yellow]Mailbox (0xFA-FB)[/yellow][/dim]")
+        console.print(
+            "[dim]Regions: [cyan]IVT (0x00-1F)[/cyan] | [magenta]ISR (0x20-2F)[/magenta] | [blue]Idle (0x30-3F)[/blue] | [green]User (0x40-F9)[/green] | [yellow]Mailbox (0xFA-FB)[/yellow][/dim]"
+        )
 
     def show_tasks(self) -> None:
         """Display list of active and terminated tasks."""
@@ -342,24 +722,38 @@ class OSSimulatorSession:
         name = demo_name.lower().strip()
         if name in ("counter", "count"):
             pid = load_counter_demo(self.ram, self.kernel)
-            console.print(f"[bold green]Loaded 'counter' demo (Task {pid}) at 0x40. Continuously increments R1 and yields.[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'counter' demo (Task {pid}) at 0x40. Continuously increments R1 and yields.[/bold green]"
+            )
         elif name in ("rogue", "fault"):
             pid = load_rogue_demo(self.ram, self.kernel)
-            console.print(f"[bold green]Loaded 'rogue' demo (Task {pid}) at 0x60. Attempts illegal memory write to trigger fault.[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'rogue' demo (Task {pid}) at 0x60. Attempts illegal memory write to trigger fault.[/bold green]"
+            )
         elif name in ("hello", "print"):
             pid = load_hello_demo(self.ram, self.kernel, "Hello OS!")
-            console.print(f"[bold green]Loaded 'hello' demo (Task {pid}) at 0x40. Invokes SYS_PRINT_STR syscall.[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'hello' demo (Task {pid}) at 0x40. Invokes SYS_PRINT_STR syscall.[/bold green]"
+            )
         elif name in ("math", "alu"):
             pid = load_math_demo(self.ram, self.kernel)
-            console.print(f"[bold green]Loaded 'math' demo (Task {pid}) at 0x40. Computes (15 + 25) * 2 = 80 and prints it.[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'math' demo (Task {pid}) at 0x40. Computes (15 + 25) * 2 = 80 and prints it.[/bold green]"
+            )
         elif name in ("multitask", "coop"):
             p1, p2 = load_multitask_demo(self.ram, self.kernel)
-            console.print(f"[bold green]Loaded 'multitask' demo (Tasks {p1} & {p2}). Alternates execution via SYS_YIELD.[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'multitask' demo (Tasks {p1} & {p2}). Alternates execution via SYS_YIELD.[/bold green]"
+            )
         elif name in ("all", "suite"):
             p1, p2 = load_all_demo(self.ram, self.kernel)
-            console.print(f"[bold green]Loaded 'all' demo suite (Task {p1}: Counter, Task {p2}: Rogue Writer).[/bold green]")
+            console.print(
+                f"[bold green]Loaded 'all' demo suite (Task {p1}: Counter, Task {p2}: Rogue Writer).[/bold green]"
+            )
         else:
-            console.print(f"[red]Unknown demo '{demo_name}'. Available: counter, rogue, hello, math, multitask, all[/red]")
+            console.print(
+                f"[red]Unknown demo '{demo_name}'. Available: counter, rogue, hello, math, multitask, all[/red]"
+            )
 
     def load_code_task(
         self,
@@ -433,7 +827,9 @@ class OSSimulatorSession:
 
         instructions = disassemble(raw_bytes, origin=start)
 
-        table = Table(title=f"RAM Disassembly (0x{start:02X} - 0x{end - 1:02X})", border_style="cyan")
+        table = Table(
+            title=f"RAM Disassembly (0x{start:02X} - 0x{end - 1:02X})", border_style="cyan"
+        )
         table.add_column("Address", style="bold yellow")
         table.add_column("Hex Bytes", style="bold white")
         table.add_column("Instruction", style="bold green")
@@ -442,15 +838,19 @@ class OSSimulatorSession:
 
         for ins in instructions:
             hex_str = " ".join(f"{b:02X}" for b in ins.raw_bytes)
-            table.add_row(f"0x{ins.address:02X}", hex_str, ins.mnemonic, ins.operands, ins.description)
+            table.add_row(
+                f"0x{ins.address:02X}", hex_str, ins.mnemonic, ins.operands, ins.description
+            )
 
         console.print(table)
 
-    def step(self, count: int = 1) -> None:
-        """Execute 1 or more CPU steps."""
+    def step_single(self) -> str | None:
+        """Execute one CPU instruction step and append formatted trace to execution_log."""
         if not self.kernel.tasks and not self.kernel.has_active_tasks():
-            console.print("[yellow]No active tasks to execute. Load a demo, code, or assembly task first.[/yellow]")
-            return
+            self.execution_log.append(
+                "[yellow]No tasks available to execute. Press 1-5 to load a demo.[/yellow]"
+            )
+            return None
 
         self.bootloader.load_ivt()
         self.kernel.install_isr()
@@ -467,31 +867,334 @@ class OSSimulatorSession:
                 self.cpu.registers["SP"] = first_task["task_sp"]
                 self.cpu.base_address = first_task["base"]
                 self.cpu.limit_address = first_task["limit"]
+                self.cpu.page_table = first_task["page_table"]
                 self.cpu.iret()
                 self.is_started = True
+
+        if self.cpu.halted:
+            return None
+
+        prev_pc = self.cpu.registers["PC"]
+        prev_acc = self.cpu.registers["ACC"]
+        phys_pc = self.cpu.translate_address(prev_pc, access_type="fetch", force=True)
+        if phys_pc is not None and 0 <= phys_pc < len(self.ram.memory):
+            raw = [self.ram.read(min(phys_pc + i, len(self.ram.memory) - 1)) for i in range(2)]
+            dis = disassemble(raw, origin=prev_pc)
+            ins_str = f"{dis[0].mnemonic} {dis[0].operands}".strip() if dis else "Unknown"
+        else:
+            ins_str = "FAULT"
+
+        self.cpu.step()
+        self.kernel.total_cycles += 1
+        curr_pc = self.cpu.registers["PC"]
+        curr_acc = self.cpu.registers["ACC"]
+
+        log_entry = (
+            f"[dim]#{self.kernel.total_cycles:03d}[/dim] "
+            f"[bold cyan]0x{prev_pc:02X}[/bold cyan] [bold white]{ins_str:<12}[/bold white] -> "
+            f"PC:[yellow]0x{curr_pc:02X}[/yellow] ACC:[yellow]0x{curr_acc:02X}[/yellow] "
+            f"R1:[dim]0x{self.cpu.registers['R1']:02X}[/dim] SP:[dim]0x{self.cpu.registers['SP']:02X}[/dim]"
+        )
+        self.execution_log.append(log_entry)
+        if len(self.execution_log) > 50:
+            self.execution_log.pop(0)
+
+        return (
+            f"PC 0x{prev_pc:02X}->0x{curr_pc:02X} | ACC: {prev_acc}->{curr_acc} | "
+            f"R1: {self.cpu.registers['R1']} | R2: {self.cpu.registers['R2']} | SP: 0x{self.cpu.registers['SP']:02X}"
+        )
+
+    def step(self, count: int = 1) -> None:
+        """Execute 1 or more CPU steps."""
+        if not self.kernel.tasks and not self.kernel.has_active_tasks():
+            console.print(
+                "[yellow]No active tasks to execute. Load a demo, code, or assembly task first.[/yellow]"
+            )
+            return
 
         for i in range(count):
             if self.cpu.halted:
                 console.print("[bold red]CPU is HALTED. No further steps possible.[/bold red]")
                 break
-            prev_pc = self.cpu.registers["PC"]
-            prev_acc = self.cpu.registers["ACC"]
-            self.cpu.step()
-            self.kernel.total_cycles += 1
-            curr_pc = self.cpu.registers["PC"]
-            curr_acc = self.cpu.registers["ACC"]
-            console.print(
-                f"[dim]Step {i + 1}: PC 0x{prev_pc:02X}->0x{curr_pc:02X} | ACC: {prev_acc}->{curr_acc} | "
-                f"R1: {self.cpu.registers['R1']} | R2: {self.cpu.registers['R2']} | SP: 0x{self.cpu.registers['SP']:02X}[/dim]"
+            msg = self.step_single()
+            if msg:
+                console.print(f"[dim]Step {i + 1}: {msg}[/dim]")
+
+    def get_dashboard_header(self, is_running: bool, status_msg: str) -> Panel:
+        """Render top dashboard status header banner."""
+        if self.cpu.halted:
+            badge = "[bold white on red] HALTED [/bold white on red]"
+        elif is_running:
+            badge = "[bold white on green] RUNNING [/bold white on green]"
+        else:
+            badge = "[bold white on yellow] PAUSED [/bold white on yellow]"
+
+        title_text = Text.from_markup(
+            f"[bold cyan]OS-SIM LIVE SPLIT-SCREEN DASHBOARD[/bold cyan]  {badge}  "
+            f"Ticks: [bold white]{self.kernel.system_ticks}[/bold white]  "
+            f"Cycles: [bold white]{self.kernel.total_cycles}[/bold white]  "
+            f"Status: {status_msg}",
+            justify="center",
+        )
+        return Panel(Align.center(title_text), border_style="cyan")
+
+    def get_trace_panel(self) -> Panel:
+        """Render recent execution history log and next instruction pipeline preview."""
+        items: list[Text] = []
+        if not self.execution_log:
+            items.append(
+                Text.from_markup(
+                    "[dim]No steps executed yet. Press [Space] or [S] to step, [R] to run.[/dim]"
+                )
             )
+        else:
+            recent = self.execution_log[-10:]
+            for line in recent:
+                items.append(Text.from_markup(line))
+
+        pc_val = self.cpu.registers["PC"]
+        phys_pc = self.cpu.translate_address(pc_val, access_type="fetch", force=True)
+        preview_lines: list[str] = ["[bold yellow]Pipeline (Next Instructions):[/bold yellow]"]
+        if phys_pc is not None and 0 <= phys_pc < len(self.ram.memory):
+            scan_vaddr = pc_val
+            for _ in range(3):
+                scan_p = self.cpu.translate_address(scan_vaddr, access_type="fetch", force=True)
+                if scan_p is None or scan_p >= len(self.ram.memory):
+                    break
+                raw = [self.ram.read(min(scan_p + j, len(self.ram.memory) - 1)) for j in range(2)]
+                dis = disassemble(raw, origin=scan_vaddr)
+                if not dis:
+                    break
+                ins = dis[0]
+                marker = "[bold yellow]>>>[/bold yellow]" if scan_vaddr == pc_val else "   "
+                preview_lines.append(
+                    f"{marker} [cyan]0x{scan_vaddr:02X}[/cyan]: [bold white]{ins.mnemonic} {ins.operands}[/bold white]"
+                )
+                scan_vaddr += len(ins.raw_bytes)
+        else:
+            preview_lines.append(
+                "    [dim red]Next instruction unmapped or out of bounds[/dim red]"
+            )
+
+        preview_text = Text.from_markup("\n".join(preview_lines))
+        return Panel(
+            Group(*items, Text(""), preview_text),
+            title="[bold green]Execution Trace & Pipeline[/bold green]",
+            border_style="green",
+        )
+
+    def get_subview_panel(self, view_mode: str = "tasks") -> Panel:
+        """Render bottom-left subview: either Process PCB Table or RAM hex dump."""
+        if view_mode == "tasks":
+            table = Table(title="Process Control Blocks (PCB)", border_style="magenta", expand=True)
+            table.add_column("PID", style="bold cyan", justify="right", width=4)
+            table.add_column("Name", style="bold white", width=14)
+            table.add_column("Prio", justify="right", width=4)
+            table.add_column("State", style="bold", width=10)
+            table.add_column("Entry", justify="right", width=6)
+            table.add_column("SP", justify="right", width=6)
+            table.add_column("Bounds [Base, Lim)", style="yellow", width=18)
+            table.add_column("Faults", justify="right", width=6)
+
+            all_tasks = self.kernel.tasks + self.kernel.terminated_tasks
+            if not all_tasks:
+                return Panel(
+                    Text.from_markup("[dim]No tasks registered in kernel.[/dim]"),
+                    title="[bold magenta]Processes[/bold magenta]",
+                    border_style="magenta",
+                )
+
+            for t in all_tasks:
+                st = t["state"]
+                if st == TaskState.RUNNING:
+                    st_str = "[green]RUNNING[/green]"
+                elif st == TaskState.READY:
+                    st_str = "[cyan]READY[/cyan]"
+                elif st == TaskState.SLEEPING:
+                    st_str = "[yellow]SLEEP[/yellow]"
+                elif st == TaskState.BLOCKED:
+                    st_str = "[magenta]BLOCK[/magenta]"
+                else:
+                    st_str = "[dim red]EXIT[/dim red]"
+
+                table.add_row(
+                    str(t["task_id"]),
+                    t["task_name"][:14],
+                    str(t["task_priority"]),
+                    st_str,
+                    f"0x{t['entry_point']:02X}",
+                    f"0x{t['task_sp']:02X}",
+                    f"[0x{t['base']:02X}, 0x{t['limit']:02X})",
+                    str(t.get("page_faults", 0)),
+                )
+            return Panel(
+                table, title="[bold magenta]Processes (PCB)[/bold magenta]", border_style="magenta"
+            )
+
+        # RAM Hex Dump subview
+        curr_task = (
+            self.kernel.tasks[self.kernel.current_task_index]
+            if self.kernel.tasks and 0 <= self.kernel.current_task_index < len(self.kernel.tasks)
+            else None
+        )
+        base = curr_task["base"] if curr_task else 0x40
+        base = max(0, min(base, len(self.ram.memory) - 64))
+        ram_table = Table(
+            title=f"RAM Partition (0x{base:02X} - 0x{base + 63:02X})",
+            border_style="blue",
+            expand=True,
+        )
+        ram_table.add_column("Offset", style="bold yellow", width=7)
+        for col in range(16):
+            ram_table.add_column(f"{col:02X}", justify="center", width=3)
+        ram_table.add_column("ASCII", style="green", width=16)
+
+        for r_base in range(base, base + 64, 16):
+            vals: list[str] = []
+            chars: list[str] = []
+            for c in range(16):
+                a = r_base + c
+                if a < len(self.ram.memory):
+                    b = self.ram.read(a)
+                    vals.append(f"{b:02X}" if b != 0 else f"[dim]{b:02X}[/dim]")
+                    chars.append(chr(b) if 32 <= b <= 126 else ".")
+                else:
+                    vals.append("  ")
+                    chars.append(" ")
+            ram_table.add_row(f"0x{r_base:02X}:", *vals, "".join(chars))
+        return Panel(ram_table, title="[bold blue]RAM Memory Dump[/bold blue]", border_style="blue")
+
+    def get_controls_footer(self) -> Panel:
+        """Render bottom keybindings cheat sheet panel."""
+        controls_text = Text.from_markup(
+            "[bold green][S][/bold green] Step  "
+            "[bold green][Space][/bold green] Step 5  "
+            "[bold green][R][/bold green] Run/Pause  "
+            "[bold green][1..5][/bold green] Demos (1:Count 2:Rogue 3:Hello 4:Math 5:Multi)  "
+            "[bold green][T][/bold green] Tasks/RAM  "
+            "[bold red][Q][/bold red] Quit",
+            justify="center",
+        )
+        return Panel(Align.center(controls_text), border_style="dim")
+
+    def run_dashboard(self, initial_demo: str | None = None) -> None:
+        """Run fullscreen live split-screen TUI dashboard with persistent right-side status inspector."""
+        if initial_demo:
+            self.load_demo(initial_demo)
+        elif not self.kernel.tasks:
+            self.load_demo("counter")
+
+        layout = Layout(name="root")
+        layout.split_row(
+            Layout(name="left", ratio=3),
+            Layout(name="right", ratio=2),
+        )
+        layout["left"].split_column(
+            Layout(name="header", size=3),
+            Layout(name="trace", ratio=3),
+            Layout(name="subview", ratio=2),
+            Layout(name="footer", size=3),
+        )
+
+        is_running = False
+        subview_mode = "tasks"
+        status_msg = "[bold green]Ready (Press S or Space to step)[/bold green]"
+
+        if not sys.stdin.isatty():
+            self.step_single()
+            layout["header"].update(self.get_dashboard_header(is_running, status_msg))
+            layout["trace"].update(self.get_trace_panel())
+            layout["subview"].update(self.get_subview_panel(subview_mode))
+            layout["footer"].update(self.get_controls_footer())
+            layout["right"].update(self.get_right_inspector_panel(compact=True))
+            console.print(layout)
+            return
+
+        with (
+            RawTerminalContext(),
+            Live(layout, screen=True, console=console, refresh_per_second=15) as live,
+        ):
+            while True:
+                layout["header"].update(self.get_dashboard_header(is_running, status_msg))
+                layout["trace"].update(self.get_trace_panel())
+                layout["subview"].update(self.get_subview_panel(subview_mode))
+                layout["footer"].update(self.get_controls_footer())
+                layout["right"].update(self.get_right_inspector_panel(compact=True))
+                live.refresh()
+
+                timeout = 0.08 if is_running else 0.2
+                key = get_key(timeout=timeout)
+
+                if is_running:
+                    if self.cpu.halted:
+                        is_running = False
+                        status_msg = "[bold red]CPU Halted[/bold red]"
+                    else:
+                        self.step_single()
+
+                if key is None:
+                    continue
+
+                if key in ("q", "Q", "\x03"):
+                    break
+                elif key in ("s", "S"):
+                    is_running = False
+                    self.step_single()
+                    status_msg = "[cyan]Stepped 1 instruction[/cyan]"
+                elif key == " ":
+                    is_running = False
+                    for _ in range(5):
+                        if self.cpu.halted:
+                            break
+                        self.step_single()
+                    status_msg = "[cyan]Stepped 5 instructions[/cyan]"
+                elif key in ("r", "R"):
+                    is_running = not is_running
+                    status_msg = (
+                        "[bold green]Continuous execution[/bold green]"
+                        if is_running
+                        else "[yellow]Execution paused[/yellow]"
+                    )
+                elif key in ("t", "T"):
+                    subview_mode = "ram" if subview_mode == "tasks" else "tasks"
+                    status_msg = f"[cyan]Switched subview to {subview_mode.upper()}[/cyan]"
+                elif key == "1":
+                    is_running = False
+                    self.reboot_clean()
+                    self.load_demo("counter")
+                    status_msg = "[bold green]Loaded: Counter[/bold green]"
+                elif key == "2":
+                    is_running = False
+                    self.reboot_clean()
+                    self.load_demo("rogue")
+                    status_msg = "[bold green]Loaded: Rogue (Page Fault Trigger)[/bold green]"
+                elif key == "3":
+                    is_running = False
+                    self.reboot_clean()
+                    self.load_demo("hello")
+                    status_msg = "[bold green]Loaded: Hello Syscall[/bold green]"
+                elif key == "4":
+                    is_running = False
+                    self.reboot_clean()
+                    self.load_demo("math")
+                    status_msg = "[bold green]Loaded: Math ALU[/bold green]"
+                elif key == "5":
+                    is_running = False
+                    self.reboot_clean()
+                    self.load_demo("multitask")
+                    status_msg = "[bold green]Loaded: Multitask Cooperative[/bold green]"
 
     def run_simulation(self, max_steps: int | None = 100) -> None:
         """Run the simulation loop until completion or max_steps."""
         if not self.kernel.tasks and not self.kernel.has_active_tasks():
-            console.print("[yellow]No active tasks to run. Load a demo, code, or assembly task first.[/yellow]")
+            console.print(
+                "[yellow]No active tasks to run. Load a demo, code, or assembly task first.[/yellow]"
+            )
             return
 
-        console.print(f"[bold cyan]>>> Executing simulation loop (max_steps={max_steps})...[/bold cyan]")
+        console.print(
+            f"[bold cyan]>>> Executing simulation loop (max_steps={max_steps})...[/bold cyan]"
+        )
         start_cycles = self.kernel.total_cycles
 
         self.bootloader.load_ivt()
@@ -500,9 +1203,13 @@ class OSSimulatorSession:
         self.is_started = True
 
         ran_cycles = self.kernel.total_cycles - start_cycles
-        console.print(f"[bold green]✓ Simulation run finished ({ran_cycles} cycles executed). CPU Halted: {self.cpu.halted}[/bold green]")
+        console.print(
+            f"[bold green]✓ Simulation run finished ({ran_cycles} cycles executed). CPU Halted: {self.cpu.halted}[/bold green]"
+        )
         if self.kernel.console_output:
-            console.print(f"[bold yellow]Kernel Console Output:[/bold yellow] {''.join(self.kernel.console_output)}")
+            console.print(
+                f"[bold yellow]Kernel Console Output:[/bold yellow] {''.join(self.kernel.console_output)}"
+            )
 
     def reboot(self, custom_text: str | None = None) -> None:
         """Reset the system and restart with startup animation."""
@@ -527,28 +1234,52 @@ def show_assembly_help() -> None:
     table.add_row("Memory I/O", "LOAD_IMM <val> / LDI", "2", "Load 8-bit immediate value into ACC")
     table.add_row("Memory I/O", "LOAD <addr> / LD", "2", "Load byte from RAM address into ACC")
     table.add_row("Memory I/O", "STORE <addr> / ST", "2", "Store ACC byte into RAM address")
-    table.add_row("Transfer", "MOV <dest>, <src>", "1-2", "Copy between ACC, R1, R2, SP, [addr], or #imm")
-    table.add_row("ALU Arithmetic", "ADD R1 | ADD R2", "1", "ACC = (ACC + Rn) & 0xFF (sets Z, C flags)")
-    table.add_row("ALU Arithmetic", "SUB R1 | SUB R2", "1", "ACC = (ACC - Rn) & 0xFF (sets Z, C flags)")
-    table.add_row("ALU Arithmetic", "MUL R1 | MUL R2", "1", "ACC = (ACC * Rn) & 0xFF (sets Z, C flags)")
-    table.add_row("ALU Arithmetic", "DIV R1 | DIV R2", "1", "ACC = (ACC // Rn) & 0xFF (traps on divide by 0)")
+    table.add_row(
+        "Transfer", "MOV <dest>, <src>", "1-2", "Copy between ACC, R1, R2, SP, [addr], or #imm"
+    )
+    table.add_row(
+        "ALU Arithmetic", "ADD R1 | ADD R2", "1", "ACC = (ACC + Rn) & 0xFF (sets Z, C flags)"
+    )
+    table.add_row(
+        "ALU Arithmetic", "SUB R1 | SUB R2", "1", "ACC = (ACC - Rn) & 0xFF (sets Z, C flags)"
+    )
+    table.add_row(
+        "ALU Arithmetic", "MUL R1 | MUL R2", "1", "ACC = (ACC * Rn) & 0xFF (sets Z, C flags)"
+    )
+    table.add_row(
+        "ALU Arithmetic", "DIV R1 | DIV R2", "1", "ACC = (ACC // Rn) & 0xFF (traps on divide by 0)"
+    )
     table.add_row("ALU Logic", "AND R1 | AND R2", "1", "Bitwise AND between Rn and ACC")
     table.add_row("ALU Logic", "OR R1  | OR R2", "1", "Bitwise OR between Rn and ACC")
     table.add_row("ALU Logic", "XOR R1 | XOR R2", "1", "Bitwise XOR between Rn and ACC")
     table.add_row("ALU Logic", "NOT / NOT ACC", "1", "Bitwise NOT on ACC")
     table.add_row("Branching", "JUMP <addr> / JMP", "2", "Unconditional jump to address or label")
-    table.add_row("Branching", "JZ <addr> / JUMP_IF_ZERO", "2", "Jump to address or label if Zero flag (Z) is set")
-    table.add_row("Kernel / Trap", "SYSCALL / INT 5", "1", "Invoke OS kernel syscall (ACC=ID, R1=arg1, R2=arg2)")
+    table.add_row(
+        "Branching",
+        "JZ <addr> / JUMP_IF_ZERO",
+        "2",
+        "Jump to address or label if Zero flag (Z) is set",
+    )
+    table.add_row(
+        "Kernel / Trap",
+        "SYSCALL / INT 5",
+        "1",
+        "Invoke OS kernel syscall (ACC=ID, R1=arg1, R2=arg2)",
+    )
     table.add_row("Kernel / Trap", "HALT / HLT", "1", "Halt CPU execution (Kernel mode only)")
     table.add_row("Kernel / Trap", "IRET", "1", "Return from interrupt and restore CPU frame")
     table.add_row("Directives", ".ORG <addr>", "0", "Set assembly location counter / base address")
     table.add_row("Directives", "DB <b0>, <b1>... / .BYTE", "N", "Define raw data bytes")
     table.add_row("Directives", '.ASCII "string"', "N", "Define raw ASCII string bytes")
-    table.add_row("Directives", '.ASCIIZ "string" / .STRING', "N+1", "Define null-terminated ASCII string")
+    table.add_row(
+        "Directives", '.ASCIIZ "string" / .STRING', "N+1", "Define null-terminated ASCII string"
+    )
     table.add_row("Directives", "<NAME> EQU <val> / .EQU", "0", "Define constant symbol alias")
     console.print(table)
 
-    sys_table = Table(title="OS System Call IDs (ACC = ID, R1 = Arg 1, R2 = Arg 2)", border_style="magenta")
+    sys_table = Table(
+        title="OS System Call IDs (ACC = ID, R1 = Arg 1, R2 = Arg 2)", border_style="magenta"
+    )
     sys_table.add_column("Syscall Constant", style="bold cyan")
     sys_table.add_column("ID", justify="right", style="yellow")
     sys_table.add_column("Arguments", style="white")
@@ -559,13 +1290,26 @@ def show_assembly_help() -> None:
     sys_table.add_row("SYS_SLEEP", "3", "R1 = Ticks", "Put task to sleep for N timer ticks")
     sys_table.add_row("SYS_GETPID", "4", "None", "Returns current Task PID in ACC")
     sys_table.add_row("SYS_PRINT_NUM", "5", "R1 = Integer", "Print 8-bit integer to console buffer")
-    sys_table.add_row("SYS_PRINT_CHAR", "6", "R1 = ASCII code", "Print single character to console buffer")
-    sys_table.add_row("SYS_PRINT_STR", "7", "R1 = RAM addr, R2 = Length", "Print string from RAM to console buffer")
-    sys_table.add_row("SYS_SPAWN", "8", "R1 = Entry point, R2 = Priority", "Spawn a new task dynamically")
+    sys_table.add_row(
+        "SYS_PRINT_CHAR", "6", "R1 = ASCII code", "Print single character to console buffer"
+    )
+    sys_table.add_row(
+        "SYS_PRINT_STR",
+        "7",
+        "R1 = RAM addr, R2 = Length",
+        "Print string from RAM to console buffer",
+    )
+    sys_table.add_row(
+        "SYS_SPAWN", "8", "R1 = Entry point, R2 = Priority", "Spawn a new task dynamically"
+    )
     sys_table.add_row("SYS_WAIT", "9", "R1 = Target PID", "Block until target task terminates")
     sys_table.add_row("SYS_KILL", "10", "R1 = Target PID", "Terminate target task")
     sys_table.add_row("SYS_GET_TICKS", "11", "None", "Returns system tick count in ACC")
     sys_table.add_row("SYS_ALLOC", "12", "R1 = Bytes", "Allocate heap memory in task partition")
+    sys_table.add_row("SYS_MUTEX_LOCK", "13", "R1 = Lock ID", "Acquire mutex lock; block if taken")
+    sys_table.add_row(
+        "SYS_MUTEX_UNLOCK", "14", "R1 = Lock ID", "Release mutex lock and wake next waiter"
+    )
     console.print(sys_table)
 
 
@@ -580,18 +1324,33 @@ def run_interactive_assembler(
 
     panel_content = Text.assemble(
         ("Interactive Assembly Studio\n", "bold cyan"),
-        ("Enter assembly instructions line-by-line. Supports labels, directives, and syscalls.\n", "white"),
+        (
+            "Enter assembly instructions line-by-line. Supports labels, directives, and syscalls.\n",
+            "white",
+        ),
         ("Target Memory Partition: ", "dim"),
         (f"[0x{base_addr:02X}, 0x{base_addr + size:02X})\n\n", "bold yellow"),
         ("Commands:\n", "bold white"),
-        ("  RUN    ", "bold green"), ("- Assemble code, create task, and execute simulation loop\n", "dim"),
-        ("  LOAD   ", "bold cyan"), ("- Assemble and register task into READY state (step manually)\n", "dim"),
-        ("  LIST   ", "bold yellow"), ("- Show lines entered so far\n", "dim"),
-        ("  CLEAR  ", "bold red"), ("- Empty current code buffer\n", "dim"),
-        ("  HELP   ", "bold magenta"), ("- Display assembly instruction & syscall cheat sheet\n", "dim"),
-        ("  EXIT   ", "bold red"), ("- Return to OS shell without assembling\n", "dim"),
+        ("  RUN    ", "bold green"),
+        ("- Assemble code, create task, and execute simulation loop\n", "dim"),
+        ("  LOAD   ", "bold cyan"),
+        ("- Assemble and register task into READY state (step manually)\n", "dim"),
+        ("  LIST   ", "bold yellow"),
+        ("- Show lines entered so far\n", "dim"),
+        ("  CLEAR  ", "bold red"),
+        ("- Empty current code buffer\n", "dim"),
+        ("  HELP   ", "bold magenta"),
+        ("- Display assembly instruction & syscall cheat sheet\n", "dim"),
+        ("  EXIT   ", "bold red"),
+        ("- Return to OS shell without assembling\n", "dim"),
     )
-    console.print(Panel(panel_content, title="[bold green]OS-SIM Assembly Studio[/bold green]", border_style="cyan"))
+    console.print(
+        Panel(
+            panel_content,
+            title="[bold green]OS-SIM Assembly Studio[/bold green]",
+            border_style="cyan",
+        )
+    )
 
     buffer: list[str] = []
 
@@ -600,7 +1359,7 @@ def run_interactive_assembler(
         prompt_str = f"[bold cyan]asm[/bold cyan] [dim][0x{base_addr:02X}:{line_no:02d}][/dim][bold white]>[/bold white] "
         try:
             user_input = Prompt.ask(prompt_str)
-        except (KeyboardInterrupt, EOFError):
+        except KeyboardInterrupt, EOFError:
             console.print("\n[yellow]Assembly studio aborted. Returning to shell.[/yellow]")
             break
 
@@ -637,7 +1396,9 @@ def run_interactive_assembler(
 
         if upper_cmd in ("RUN", "EXEC", "LOAD"):
             if not buffer:
-                console.print("[yellow]Buffer is empty. Enter instructions before compiling.[/yellow]")
+                console.print(
+                    "[yellow]Buffer is empty. Enter instructions before compiling.[/yellow]"
+                )
                 continue
 
             asm_source = "\n".join(buffer)
@@ -675,7 +1436,9 @@ def run_interactive_assembler(
             if upper_cmd in ("RUN", "EXEC"):
                 session.run_simulation(max_steps=100)
             else:
-                console.print(f"[bold green]Task '{pcb.name}' is READY. Use 'run' or 'step' to execute.[/bold green]")
+                console.print(
+                    f"[bold green]Task '{pcb.name}' is READY. Use 'run' or 'step' to execute.[/bold green]"
+                )
 
             break
 
@@ -690,22 +1453,51 @@ def show_interactive_help() -> None:
     table.add_column("Description", style="white")
 
     table.add_row("help / ?", "", "Show this commands manual")
+    table.add_row(
+        "dashboard / tui",
+        "[demo]",
+        "Launch fullscreen live split dashboard with right-side inspector",
+    )
     table.add_row("status", "", "Display overall OS subsystem health and task counts")
-    table.add_row("cpu", "", "Show detailed CPU registers, flags, and memory bounds")
-    table.add_row("mem / ram", "[start=0] [len=256]", "Inspect colored RAM hex dump and memory regions")
+    table.add_row(
+        "cpu / mmu / regs", "", "Show detailed CPU registers, flags, executing frame, and MMU table"
+    )
+    table.add_row(
+        "mem / ram", "[start=0] [len=256]", "Inspect colored RAM hex dump and memory regions"
+    )
     table.add_row("ps / tasks", "", "List all registered process control blocks (PCB)")
-    table.add_row("demo", "<counter|rogue|hello|math|multitask|all>", "Load pre-built machine code tasks")
-    table.add_row("asm", "[task_name=Task_UserASM]", "Open interactive assembly studio to write assembly code")
-    table.add_row("code / task-code", "<name> <b0> <b1>...", "Write machine code bytes and register task directly")
-    table.add_row("exec / run-asm", "<file.asm> [steps=100]", "Assemble file from disk and execute immediately")
-    table.add_row("load-asm", "<file.asm> [prio=1] [size=32]", "Assemble file from disk and register in READY state")
-    table.add_row("disasm", "[start=0x40] [len=16]", "Disassemble bytes in RAM into assembly mnemonics")
+    table.add_row(
+        "demo", "<counter|rogue|hello|math|multitask|all>", "Load pre-built machine code tasks"
+    )
+    table.add_row(
+        "asm", "[task_name=Task_UserASM]", "Open interactive assembly studio to write assembly code"
+    )
+    table.add_row(
+        "code / task-code",
+        "<name> <b0> <b1>...",
+        "Write machine code bytes and register task directly",
+    )
+    table.add_row(
+        "exec / run-asm",
+        "<file.asm> [steps=100]",
+        "Assemble file from disk and execute immediately",
+    )
+    table.add_row(
+        "load-asm",
+        "<file.asm> [prio=1] [size=32]",
+        "Assemble file from disk and register in READY state",
+    )
+    table.add_row(
+        "disasm", "[start=0x40] [len=16]", "Disassemble bytes in RAM into assembly mnemonics"
+    )
     table.add_row("run", "[steps=100]", "Run kernel multitasking loop")
     table.add_row("step", "[count=1]", "Execute 1 or more CPU instruction cycles")
     table.add_row("load", "<addr> <byte0> <byte1>...", "Write raw machine code bytes into RAM")
     table.add_row("read", "<addr>", "Read byte value at RAM address")
     table.add_row("write", "<addr> <value>", "Write byte value to RAM address")
-    table.add_row("spawn", "<name> <entry> [base] [size=32] [prio=1]", "Forge and register a new task PCB")
+    table.add_row(
+        "spawn", "<name> <entry> [base] [size=32] [prio=1]", "Forge and register a new task PCB"
+    )
     table.add_row("kill", "<pid>", "Terminate a task using sys_kill")
     table.add_row("dmesg / logs", "", "View output buffer from SYS_PRINT_* syscalls")
     table.add_row("say", "<text>", "Typewriter text broadcast animation")
@@ -717,13 +1509,15 @@ def show_interactive_help() -> None:
 
 def run_interactive_shell(session: OSSimulatorSession) -> None:
     """Run interactive REPL shell for the OS simulation."""
-    console.print("[dim]Type [bold white]'help'[/bold white] to view available commands, or [bold white]'demo all'[/bold white] to load sample tasks.[/dim]\n")
+    console.print(
+        "[dim]Type [bold white]'help'[/bold white] to view available commands, or [bold white]'demo all'[/bold white] to load sample tasks.[/dim]\n"
+    )
 
     while True:
         try:
             raw_prompt = "[bold green]os-sim[/bold green][bold white]>[/bold white] "
             user_input = Prompt.ask(raw_prompt)
-        except (KeyboardInterrupt, EOFError):
+        except KeyboardInterrupt, EOFError:
             console.print("\n[dim]Received shutdown signal. Exiting OS-SIM.[/dim]")
             break
 
@@ -744,10 +1538,14 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
             case "help" | "?":
                 show_interactive_help()
 
+            case "dashboard" | "tui" | "live":
+                demo_arg = args[0] if args else None
+                session.run_dashboard(initial_demo=demo_arg)
+
             case "status":
                 session.show_status()
 
-            case "cpu":
+            case "cpu" | "mmu" | "regs" | "registers" | "frames" | "pages":
                 session.show_cpu()
 
             case "mem" | "ram":
@@ -760,7 +1558,9 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
 
             case "demo":
                 if not args:
-                    console.print("[yellow]Usage: demo <counter|rogue|hello|math|multitask|all>[/yellow]")
+                    console.print(
+                        "[yellow]Usage: demo <counter|rogue|hello|math|multitask|all>[/yellow]"
+                    )
                 else:
                     session.load_demo(args[0])
 
@@ -774,13 +1574,17 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
 
             case "load":
                 if len(args) < 2:
-                    console.print("[yellow]Usage: load <addr> <b0> <b1> <b2>... (e.g. load 0x40 0x03 0x01 0x10)[/yellow]")
+                    console.print(
+                        "[yellow]Usage: load <addr> <b0> <b1> <b2>... (e.g. load 0x40 0x03 0x01 0x10)[/yellow]"
+                    )
                 else:
                     target_addr = parse_int(args[0])
                     bytes_to_write = [parse_int(b) for b in args[1:]]
                     for offset, byte in enumerate(bytes_to_write):
                         session.ram.write(target_addr + offset, byte)
-                    console.print(f"[bold green]Wrote {len(bytes_to_write)} bytes starting at 0x{target_addr:02X}.[/bold green]")
+                    console.print(
+                        f"[bold green]Wrote {len(bytes_to_write)} bytes starting at 0x{target_addr:02X}.[/bold green]"
+                    )
 
             case "read":
                 if not args:
@@ -797,11 +1601,15 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
                     addr = parse_int(args[0])
                     val = parse_int(args[1])
                     session.ram.write(addr, val)
-                    console.print(f"[bold green]RAM[0x{addr:02X}] <- 0x{val:02X} ({val})[/bold green]")
+                    console.print(
+                        f"[bold green]RAM[0x{addr:02X}] <- 0x{val:02X} ({val})[/bold green]"
+                    )
 
             case "code" | "task-code" | "load-code":
                 if len(args) < 2:
-                    console.print("[yellow]Usage: code <name> <b0> <b1> <b2>... [prio=1] [size=32][/yellow]")
+                    console.print(
+                        "[yellow]Usage: code <name> <b0> <b1> <b2>... [prio=1] [size=32][/yellow]"
+                    )
                 else:
                     task_name = args[0]
                     raw_bytes = [parse_int(b) for b in args[1:]]
@@ -828,14 +1636,18 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
 
             case "load-asm":
                 if not args:
-                    console.print("[yellow]Usage: load-asm <file.asm> [priority=1] [size=32][/yellow]")
+                    console.print(
+                        "[yellow]Usage: load-asm <file.asm> [priority=1] [size=32][/yellow]"
+                    )
                 else:
                     file_path = args[0]
                     prio = parse_int(args[1]) if len(args) > 1 else 1
                     sz = parse_int(args[2]) if len(args) > 2 else 32
                     try:
                         pcb, _ = session.load_asm_file(file_path, priority=prio, size=sz)
-                        console.print(f"[bold green]Task '{pcb.name}' is READY. Use 'run' or 'step' to execute.[/bold green]")
+                        console.print(
+                            f"[bold green]Task '{pcb.name}' is READY. Use 'run' or 'step' to execute.[/bold green]"
+                        )
                     except Exception as err:
                         console.print(f"[red]Assembly load error: {err}[/red]")
 
@@ -846,7 +1658,9 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
 
             case "spawn":
                 if len(args) < 2:
-                    console.print("[yellow]Usage: spawn <name> <entry_point> [base] [size=32] [priority=1][/yellow]")
+                    console.print(
+                        "[yellow]Usage: spawn <name> <entry_point> [base] [size=32] [priority=1][/yellow]"
+                    )
                 else:
                     task_name = args[0]
                     entry = parse_int(args[1])
@@ -869,7 +1683,10 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
                     if limit > len(session.ram.memory) - 8:
                         console.print("[red]Error: Out of RAM space for new partition.[/red]")
                     else:
-                        existing_pids = [t["task_id"] for t in session.kernel.tasks + session.kernel.terminated_tasks]
+                        existing_pids = [
+                            t["task_id"]
+                            for t in session.kernel.tasks + session.kernel.terminated_tasks
+                        ]
                         new_pid = max(existing_pids, default=-1) + 1
                         session.kernel.create_task(
                             task_id=new_pid,
@@ -880,7 +1697,9 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
                             base=base,
                             limit=limit,
                         )
-                        console.print(f"[bold green]Spawned task '{task_name}' (PID {new_pid}) @ [0x{base:02X}, 0x{limit:02X}), entry: 0x{entry:02X}[/bold green]")
+                        console.print(
+                            f"[bold green]Spawned task '{task_name}' (PID {new_pid}) @ [0x{base:02X}, 0x{limit:02X}), entry: 0x{entry:02X}[/bold green]"
+                        )
 
             case "kill":
                 if not args:
@@ -898,7 +1717,13 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
                 if not logs:
                     console.print("[dim]Kernel console log buffer is empty.[/dim]")
                 else:
-                    console.print(Panel("".join(logs), title="Kernel Console Buffer (dmesg)", border_style="yellow"))
+                    console.print(
+                        Panel(
+                            "".join(logs),
+                            title="Kernel Console Buffer (dmesg)",
+                            border_style="yellow",
+                        )
+                    )
 
             case "say":
                 text_to_say = " ".join(args)
@@ -915,11 +1740,15 @@ def run_interactive_shell(session: OSSimulatorSession) -> None:
                 console.clear()
 
             case "exit" | "shutdown" | "quit":
-                console.print("[bold green]System shutting down... All subsystems halted. Goodbye![/bold green]")
+                console.print(
+                    "[bold green]System shutting down... All subsystems halted. Goodbye![/bold green]"
+                )
                 break
 
             case _:
-                console.print(f"[red]Unknown command: '{cmd}'. Type 'help' for available commands.[/red]")
+                console.print(
+                    f"[red]Unknown command: '{cmd}'. Type 'help' for available commands.[/red]"
+                )
 
 
 @app.callback(invoke_without_command=True)
@@ -957,6 +1786,12 @@ def main(
         int,
         typer.Option("--steps", help="Maximum simulation steps if running a demo."),
     ] = 100,
+    dashboard: Annotated[
+        bool,
+        typer.Option(
+            "--dashboard", "-D", help="Launch fullscreen live split-screen dashboard directly."
+        ),
+    ] = False,
     batch: Annotated[
         bool,
         typer.Option("--batch", help="Exit after boot/demo instead of opening interactive shell."),
@@ -973,6 +1808,10 @@ def main(
     session = OSSimulatorSession(speed=0.0 if quick else speed, animate=anim_enabled)
     session.play_startup_animation(custom_text=startup_text)
 
+    if dashboard:
+        session.run_dashboard(initial_demo=demo)
+        return
+
     if demo:
         session.load_demo(demo)
         session.run_simulation(max_steps=steps)
@@ -983,6 +1822,18 @@ def main(
 
     if not batch:
         run_interactive_shell(session)
+
+
+@app.command("dashboard")
+@app.command("tui")
+def dashboard_cmd(
+    demo: Annotated[
+        str | None, typer.Option("--demo", "-d", help="Load built-in demo into dashboard")
+    ] = None,
+) -> None:
+    """Launch fullscreen live split dashboard with persistent right-side inspector."""
+    session = OSSimulatorSession(speed=0.0, animate=False)
+    session.run_dashboard(initial_demo=demo)
 
 
 @app.command("boot")
@@ -999,9 +1850,13 @@ def boot_cmd(
 
 @app.command("demo")
 def demo_cmd(
-    name: Annotated[str, typer.Argument(help="Demo name: counter, rogue, hello, math, multitask, all")] = "all",
+    name: Annotated[
+        str, typer.Argument(help="Demo name: counter, rogue, hello, math, multitask, all")
+    ] = "all",
     steps: Annotated[int, typer.Option("--steps", help="Number of CPU steps to run")] = 100,
-    interactive: Annotated[bool, typer.Option("--interactive", "-i", help="Enter shell after demo")] = False,
+    interactive: Annotated[
+        bool, typer.Option("--interactive", "-i", help="Enter shell after demo")
+    ] = False,
 ) -> None:
     """Boot the OS, load a demonstration program, and run it."""
     session = OSSimulatorSession(speed=0.0, animate=False)
@@ -1030,6 +1885,36 @@ def asm_cmd(
 
     if not batch:
         run_interactive_shell(session)
+
+
+@app.command("cpu")
+def cpu_cmd(
+    demo: Annotated[
+        str | None, typer.Option("--demo", "-d", help="Load demo before showing CPU status")
+    ] = None,
+    steps: Annotated[
+        int, typer.Option("--steps", help="CPU steps to run before showing status")
+    ] = 0,
+    interactive: Annotated[
+        bool, typer.Option("--interactive", "-i", help="Enter interactive shell after display")
+    ] = False,
+) -> None:
+    """Display detailed CPU registers, ALU flags, executing frame, and MMU page table."""
+    session = OSSimulatorSession(speed=0.0, animate=False)
+    if demo:
+        session.load_demo(demo)
+        if steps > 0:
+            session.step(count=steps)
+    session.show_cpu()
+    if interactive:
+        run_interactive_shell(session)
+
+
+@app.command("status")
+def status_cmd() -> None:
+    """Display OS subsystem status and task counts."""
+    session = OSSimulatorSession(speed=0.0, animate=False)
+    session.show_status()
 
 
 if __name__ == "__main__":

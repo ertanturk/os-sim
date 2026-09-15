@@ -10,36 +10,19 @@ if TYPE_CHECKING:
 
 
 def load_counter_demo(ram: RAM, kernel: Kernel) -> int:
-    """Load a counter / cooperative yield loop task.
+    """Load a counter / cooperative yield loop task using kernel page allocation.
 
     Task 0 continuously increments R1 by 1 and yields CPU via SYS_YIELD (0x01).
     """
-    # Bytecode:
-    # 0x03, 0x01  -> LOAD_IMM 1
-    # 0x10        -> ADD R1
-    # 0x20        -> MOV R1, ACC
-    # 0x03, 0x01  -> LOAD_IMM 1 (SYS_YIELD)
-    # 0x05        -> SYSCALL
-    # 0x30, 0x40  -> JUMP 0x40 (64)
     code = [0x03, 0x01, 0x10, 0x20, 0x03, 0x01, 0x05, 0x30, 0x40]
-    base = 64
-    limit = 96
-    entry_point = 64
-    stack_top = 95
-
-    for i, byte in enumerate(code):
-        ram.write(base + i, byte)
-
-    kernel.create_task(
-        task_id=0,
+    task = kernel.load_task_code(
         name="Task_Counter",
+        code=code,
         priority=1,
-        entry_point=entry_point,
-        stack_top=stack_top,
-        base=base,
-        limit=limit,
+        partition_size=32,
+        base_address=64,
     )
-    return 0
+    return task["task_id"]
 
 
 def load_rogue_demo(ram: RAM, kernel: Kernel) -> int:
@@ -48,48 +31,22 @@ def load_rogue_demo(ram: RAM, kernel: Kernel) -> int:
     Task 1 tries to write 0xAA into address 0x40 (Task 0's memory),
     triggering a hardware memory protection fault.
     """
-    # Bytecode:
-    # 0x03, 0xAA  -> LOAD_IMM 0xAA
-    # 0x02, 0x40  -> STORE 0x40 (Illegal write outside [96, 128))
     code = [0x03, 0xAA, 0x02, 0x40]
-    base = 96
-    limit = 128
-    entry_point = 96
-    stack_top = 127
-
-    for i, byte in enumerate(code):
-        ram.write(base + i, byte)
-
-    kernel.create_task(
-        task_id=1,
+    task = kernel.load_task_code(
         name="Task_Rogue_Writer",
+        code=code,
         priority=1,
-        entry_point=entry_point,
-        stack_top=stack_top,
-        base=base,
-        limit=limit,
+        partition_size=32,
+        base_address=96,
     )
-    return 1
+    return task["task_id"]
 
 
 def load_hello_demo(ram: RAM, kernel: Kernel, message: str = "Hello OS!") -> int:
     """Load a task that prints a string using the SYS_PRINT_STR system call."""
     base = 64
-    limit = 96
-    entry_point = 64
-    stack_top = 95
     str_addr = 80
-
     msg_bytes = message.encode("ascii", errors="replace")[:14] + b"\x00"
-    for i, b in enumerate(msg_bytes):
-        ram.write(str_addr + i, b)
-
-    # Bytecode:
-    # LOAD_IMM str_addr -> MOV R1, ACC
-    # LOAD_IMM len(msg_bytes)-1 -> MOV R2, ACC
-    # LOAD_IMM 7 (SYS_PRINT_STR) -> SYSCALL
-    # LOAD_IMM 0 -> MOV R1, ACC
-    # LOAD_IMM 2 (SYS_EXIT) -> SYSCALL
     length = len(msg_bytes) - 1
     code = [
         0x03,
@@ -108,20 +65,16 @@ def load_hello_demo(ram: RAM, kernel: Kernel, message: str = "Hello OS!") -> int
         kernel.SYS_EXIT,
         0x05,
     ]
-
-    for i, byte in enumerate(code):
-        ram.write(base + i, byte)
-
-    kernel.create_task(
-        task_id=0,
+    task = kernel.load_task_code(
         name="Task_Hello",
+        code=code,
         priority=1,
-        entry_point=entry_point,
-        stack_top=stack_top,
-        base=base,
-        limit=limit,
+        partition_size=32,
+        base_address=base,
     )
-    return 0
+    for i, b in enumerate(msg_bytes):
+        kernel._write_task_byte(task, str_addr + i, b)
+    return task["task_id"]
 
 
 def load_math_demo(ram: RAM, kernel: Kernel) -> int:
@@ -129,11 +82,6 @@ def load_math_demo(ram: RAM, kernel: Kernel) -> int:
 
     Calculates: (15 + 25) * 2 = 80, prints 80, and exits.
     """
-    base = 64
-    limit = 96
-    entry_point = 64
-    stack_top = 95
-
     code = [
         0x03,
         15,  # LOAD_IMM 15
@@ -156,25 +104,18 @@ def load_math_demo(ram: RAM, kernel: Kernel) -> int:
         kernel.SYS_EXIT,  # LOAD_IMM 2 (SYS_EXIT)
         0x05,  # SYSCALL
     ]
-
-    for i, byte in enumerate(code):
-        ram.write(base + i, byte)
-
-    kernel.create_task(
-        task_id=0,
+    task = kernel.load_task_code(
         name="Task_Math",
+        code=code,
         priority=1,
-        entry_point=entry_point,
-        stack_top=stack_top,
-        base=base,
-        limit=limit,
+        partition_size=32,
+        base_address=64,
     )
-    return 0
+    return task["task_id"]
 
 
 def load_multitask_demo(ram: RAM, kernel: Kernel) -> tuple[int, int]:
     """Load two cooperative tasks that alternate execution using SYS_YIELD."""
-    # Task A at 64
     t0_code = [
         0x03,
         100,
@@ -198,10 +139,6 @@ def load_multitask_demo(ram: RAM, kernel: Kernel) -> tuple[int, int]:
         kernel.SYS_EXIT,
         0x05,  # Exit 0
     ]
-    for i, b in enumerate(t0_code):
-        ram.write(64 + i, b)
-
-    # Task B at 96
     t1_code = [
         0x03,
         200,
@@ -225,12 +162,21 @@ def load_multitask_demo(ram: RAM, kernel: Kernel) -> tuple[int, int]:
         kernel.SYS_EXIT,
         0x05,  # Exit 0
     ]
-    for i, b in enumerate(t1_code):
-        ram.write(96 + i, b)
-
-    kernel.create_task(0, "Task_A", 1, 64, 95, 64, 96)
-    kernel.create_task(1, "Task_B", 1, 96, 127, 96, 128)
-    return 0, 1
+    task0 = kernel.load_task_code(
+        name="Task_A",
+        code=t0_code,
+        priority=1,
+        partition_size=32,
+        base_address=64,
+    )
+    task1 = kernel.load_task_code(
+        name="Task_B",
+        code=t1_code,
+        priority=1,
+        partition_size=32,
+        base_address=96,
+    )
+    return task0["task_id"], task1["task_id"]
 
 
 def load_all_demo(ram: RAM, kernel: Kernel) -> tuple[int, int]:
